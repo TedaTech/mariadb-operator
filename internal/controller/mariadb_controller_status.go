@@ -133,6 +133,14 @@ func (r *MariaDBReconciler) getReplicationRoles(ctx context.Context,
 			role = mariadbv1alpha1.ReplicationRoleReplica
 		} else if hasConnectedReplicas {
 			role = mariadbv1alpha1.ReplicationRolePrimary
+		} else if mdb.Status.CurrentPrimaryPodIndex != nil && i == *mdb.Status.CurrentPrimaryPodIndex {
+			// Not replicating from anyone and nobody replicating from it. That
+			// is a primary whose replicas have not reconnected yet — normal for
+			// the seconds after a failover, and the steady state of a cluster
+			// reduced to one surviving node. Reporting Unknown there is not
+			// just cosmetic: the switchover machinery reads these roles, so a
+			// primary that never sheds Unknown keeps the resource wedged.
+			role = mariadbv1alpha1.ReplicationRolePrimary
 		}
 		if replState == nil {
 			replState = make(map[string]mariadbv1alpha1.ReplicationRole)
