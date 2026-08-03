@@ -788,6 +788,20 @@ func (c Client) IsReplicationReplica(ctx context.Context) (bool, error) {
 	return c.Exists(ctx, "SHOW REPLICA STATUS")
 }
 
+// ReplicaMasterHost returns the host this replica is configured to replicate
+// from, or "" when it is not replicating at all.
+//
+// Master_Host is the only way to tell a replica that is merely lagging from one
+// that is faithfully following a primary which no longer exists: both keep
+// Slave_SQL_Running=Yes and simply never advance.
+func (c Client) ReplicaMasterHost(ctx context.Context) (string, error) {
+	row, err := c.QueryColumnMap(ctx, "SHOW REPLICA STATUS")
+	if err != nil {
+		return "", fmt.Errorf("error getting replica status: %v", err)
+	}
+	return row["Master_Host"], nil
+}
+
 // See: https://mariadb.com/docs/server/reference/sql-statements/administrative-sql-statements/show/show-replica-status
 func (c Client) ReplicaStatus(ctx context.Context, logger logr.Logger) (*mariadbv1alpha1.ReplicaStatusVars, error) {
 	row, err := c.QueryColumnMap(ctx, "SHOW REPLICA STATUS")
