@@ -384,13 +384,32 @@ func (r *ReplicationReconciler) connectReplicasToNewPrimary(ctx context.Context,
 				return fmt.Errorf("error getting pod: %w", err)
 			}
 			if !mariadbpod.PodReady(&pod) {
-				logger.V(1).Info("Skipping non ready Pod when connecting replicas to new primary", "pod", key.Name)
-				return nil
+				// On the failover path this gate skips EVERY replica: they all
+				// lost their IO thread when the primary died, so their
+				// replication-aware readiness probe fails, so none of them is
+				// repointed and all of them keep replicating from a primary
+				// that no longer exists. That is precisely the state that has
+				// to be repaired by hand — CHANGE MASTER on each survivor —
+				// after an otherwise successful failover. It also starves the
+				// new primary of connected replicas, which is what leaves it
+				// classified as Unknown.
+				//
+				// Reachability is established for real by the SQL client below,
+				// so all that is needed here is a Pod that is actually running.
+				if req.currentPrimaryReady || pod.Status.Phase != corev1.PodRunning {
+					logger.V(1).Info("Skipping non ready Pod when connecting replicas to new primary", "pod", key.Name)
+					return nil
+				}
 			}
 
 			replClient, err := req.replClientSet.clientForIndex(ctx, i)
 			if err != nil {
-				return fmt.Errorf("error getting replica '%d' client: %v", i, err)
+				// One unreachable replica must not fail the phase: that
+				// restarts the whole switchover from the top, and on a
+				// permanently dead node it would never stop. The steady-state
+				// reconcile picks this replica up once it is back.
+				logger.Info("Skipping unreachable replica when connecting to new primary", "replica", i, "err", err)
+				return nil
 			}
 			topology := r.topologyManager.TopologyForMariaDB(req.mariadb, logger.WithValues("replica", i))
 
