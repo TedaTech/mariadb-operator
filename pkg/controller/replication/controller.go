@@ -261,10 +261,18 @@ func (r *ReplicationReconciler) ReconcileReplicationInPod(ctx context.Context, r
 			// forever, so this early return is the reason a survivor of a
 			// failover has to be reattached by hand. Re-point it instead.
 			stale, err := r.replicaFollowsWrongPrimary(ctx, req, podIndex, primaryPodIndex, pod, logger)
-			if err != nil || !stale {
-				return ctrl.Result{}, nil
+			if err == nil && stale {
+				logger.Info("Replica follows a stale primary, reconfiguring", "pod", pod)
+			} else {
+				// Full replica configuration is skipped — but read_only is a
+				// runtime SET GLOBAL that is not persisted, and it is only ever
+				// written on a role change. A replica that merely restarts, and
+				// an ex-primary demoted before this status was written, both
+				// come back writable and stay that way indefinitely. A stray
+				// write there does not replicate and diverges the cluster
+				// permanently, so re-assert it every reconcile.
+				return ctrl.Result{}, r.assertReplicaReadOnly(ctx, req, podIndex, pod, logger)
 			}
-			logger.Info("Replica follows a stale primary, reconfiguring", "pod", pod)
 		}
 	}
 
@@ -311,6 +319,33 @@ func (r *ReplicationReconciler) replicaFollowsWrongPrimary(ctx context.Context, 
 	}
 	logger.V(1).Info("Replica follows an unexpected primary", "pod", pod, "master", host, "want", want)
 	return true, nil
+}
+
+// assertReplicaReadOnly makes read_only=ON true of an already-configured
+// replica. It reads before writing so a converged cluster costs one cheap
+// SELECT per reconcile and never touches the server, and it is deliberately
+// non-fatal: a replica that cannot be reached is a problem for the rest of the
+// reconcile loop to surface, not a reason to abort it here.
+func (r *ReplicationReconciler) assertReplicaReadOnly(ctx context.Context, req *ReconcileRequest, podIndex int,
+	pod string, logger logr.Logger) error {
+	client, err := req.replClientSet.clientForIndex(ctx, podIndex)
+	if err != nil {
+		logger.V(1).Info("error getting replica client to assert read_only", "err", err, "pod", pod)
+		return nil
+	}
+	readOnly, err := client.IsSystemVariableEnabled(ctx, "read_only")
+	if err != nil {
+		logger.V(1).Info("error reading read_only from replica", "err", err, "pod", pod)
+		return nil
+	}
+	if readOnly {
+		return nil
+	}
+	logger.Info("Replica is writable, re-asserting read_only", "pod", pod)
+	if err := client.EnableReadOnly(ctx); err != nil {
+		return fmt.Errorf("error enabling read_only in replica '%s': %v", pod, err)
+	}
+	return nil
 }
 
 func (r *ReplicationReconciler) getReplicaOpts(ctx context.Context, req *ReconcileRequest, pod string, index int,
