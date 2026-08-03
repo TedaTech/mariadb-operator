@@ -36,15 +36,61 @@ func NewFailoverHandler(client client.Client, mariadb *mariadbv1alpha1.MariaDB,
 	}
 }
 
+// candidateOpts gates which replicas may be considered for promotion.
+//
+// The defaults are the strict rules that apply during a switchover, where the
+// current primary is alive and every replica should therefore be fully healthy.
+// They are wrong during a failover, where the primary is gone by definition:
+// see WithPrimaryDown.
+type candidateOpts struct {
+	requirePodReady bool
+	requireIOThread bool
+}
+
+// CandidateOpt customises promotion-candidate selection.
+type CandidateOpt func(*candidateOpts)
+
+// WithPrimaryDown relaxes the two gates a dead primary necessarily trips.
+//
+// Pod readiness for a replica is replication-aware: the agent's readiness probe
+// reports failure when Seconds_Behind_Master cannot be determined, and
+// Seconds_Behind_Master is NULL whenever the IO thread is not running. When the
+// primary dies, every replica loses its IO thread within seconds, so every
+// replica goes NotReady — before the kubelet has even marked the primary Pod
+// NotReady (bound by node-monitor-grace-period). By the time failover is
+// triggered there is nothing left that satisfies the strict gates, and failover
+// is silently skipped for as long as the primary stays down. Requiring a
+// running IO thread on the failover path is likewise self-contradictory: there
+// is no primary left for it to connect to.
+//
+// The safety property that actually matters is preserved either way: a
+// candidate must still have its SQL thread running and its relay log fully
+// applied, so it cannot be promoted while holding unapplied events, and
+// ranking still picks the furthest-advanced GTID among the survivors.
+func WithPrimaryDown() CandidateOpt {
+	return func(o *candidateOpts) {
+		o.requirePodReady = false
+		o.requireIOThread = false
+	}
+}
+
 // FurthestAdvancedReplica finds a candidate to be promoted as primary, taking into account replica status.
-func (f *FailoverHandler) FurthestAdvancedReplica(ctx context.Context) (string, error) {
+func (f *FailoverHandler) FurthestAdvancedReplica(ctx context.Context, opts ...CandidateOpt) (string, error) {
 	pods, err := mdbpod.ListMariaDBSecondaryPods(ctx, f.client, f.mariadb)
 	if err != nil {
 		return "", fmt.Errorf("error listing secondary Pods: %v", err)
 	}
 	f.logger.Info("Finding candidates to be promoted to primary")
 
-	candidates := f.findCandidates(ctx, pods)
+	candidateOpts := candidateOpts{
+		requirePodReady: true,
+		requireIOThread: true,
+	}
+	for _, setOpt := range opts {
+		setOpt(&candidateOpts)
+	}
+
+	candidates := f.findCandidates(ctx, pods, candidateOpts)
 	sort.Slice(candidates, func(i, j int) bool {
 		return candidates[i].name < candidates[j].name
 	})
@@ -65,13 +111,32 @@ type promotionCandidate struct {
 	gtidCurrentPos *replication.Gtid
 }
 
-func (f *FailoverHandler) findCandidates(ctx context.Context, pods []corev1.Pod) []promotionCandidate {
+// podEligible decides whether a Pod may be considered at all, before any SQL
+// connection is attempted. It returns a reason suitable for logging when the
+// Pod is rejected.
+func podEligible(pod *corev1.Pod, opts candidateOpts) (string, bool) {
+	if opts.requirePodReady {
+		if !mdbpod.PodReady(pod) {
+			return "Pod not ready", false
+		}
+		return "", true
+	}
+	// Readiness is not usable here (see WithPrimaryDown), but a Pod that is not
+	// Running cannot serve as a primary either. Real reachability is verified by
+	// the SQL connection the caller opens next.
+	if pod.Status.Phase != corev1.PodRunning {
+		return fmt.Sprintf("Pod not running (phase %q)", pod.Status.Phase), false
+	}
+	return "", true
+}
+
+func (f *FailoverHandler) findCandidates(ctx context.Context, pods []corev1.Pod, opts candidateOpts) []promotionCandidate {
 	candidates := make([]promotionCandidate, 0, len(pods))
 	for _, pod := range pods {
 		podLogger := f.logger.WithValues("name", pod.Name)
 
-		if !mdbpod.PodReady(&pod) {
-			podLogger.Info("Pod not ready. Skipping...")
+		if reason, ok := podEligible(&pod, opts); !ok {
+			podLogger.Info(reason + ". Skipping...")
 			continue
 		}
 		podIndex, err := mdbsts.PodIndex(pod.Name)
@@ -93,10 +158,12 @@ func (f *FailoverHandler) findCandidates(ctx context.Context, pods []corev1.Pod)
 			continue
 		}
 
-		slaveIORunning := ptr.Deref(status.SlaveIORunning, false)
-		if !slaveIORunning {
-			podLogger.Info("IO thread not running. Skipping...")
-			continue
+		if opts.requireIOThread {
+			slaveIORunning := ptr.Deref(status.SlaveIORunning, false)
+			if !slaveIORunning {
+				podLogger.Info("IO thread not running. Skipping...")
+				continue
+			}
 		}
 		slaveSQLRunning := ptr.Deref(status.SlaveSQLRunning, false)
 		if !slaveSQLRunning {

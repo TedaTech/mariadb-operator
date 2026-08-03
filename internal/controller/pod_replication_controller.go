@@ -103,12 +103,22 @@ func (r *PodReplicationController) ReconcilePodNotReady(ctx context.Context, pod
 
 	primary := mariadb.Status.CurrentPrimaryPodIndex
 
+	// The primary is down — that is the only reason this code path runs — so the
+	// strict switchover gates (Pod readiness, running IO thread) cannot be met by
+	// any replica and must be relaxed. See replication.WithPrimaryDown.
 	newPrimaryName, err := replication.NewFailoverHandler(
 		r.Client,
 		mariadb,
 		log.FromContext(ctx).WithName("failover").V(1),
-	).FurthestAdvancedReplica(ctx)
+	).FurthestAdvancedReplica(ctx, replication.WithPrimaryDown())
 	if err != nil {
+		// Without this the failover is skipped in silence: the CR simply stays
+		// on the dead primary with no event and no non-verbose log line, which
+		// is indistinguishable from "no failover was needed".
+		logger.Error(err, "Unable to select a promotion candidate, automatic failover skipped", "primary", *primary)
+		r.recorder.Eventf(mariadb, nil, corev1.EventTypeWarning, mariadbv1alpha1.ReasonPrimarySwitchNoCandidates,
+			mariadbv1alpha1.ActionReconciling,
+			"Automatic failover from primary index '%d' skipped: %v", *primary, err)
 		return fmt.Errorf("error getting promotion candidate: %v", err)
 	}
 	newPrimary, err := statefulset.PodIndex(newPrimaryName)
