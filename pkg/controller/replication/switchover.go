@@ -62,6 +62,10 @@ func (r *ReplicationReconciler) reconcileSwitchover(ctx context.Context, req *Re
 	newPrimaryPodName := statefulset.PodName(req.mariadb.ObjectMeta, *replication.Primary.PodIndex)
 	logger = logger.WithValues("primary", primary, "new-primary", newPrimary)
 
+	// Pin the primary this switchover started from, so every phase acts on the same old
+	// primary regardless of when status is patched.
+	req.switchoverFromPodIndex = primary
+
 	if err := r.patchStatus(ctx, req.mariadb, func(status *mariadbv1alpha1.MariaDBStatus) {
 		condition.SetPrimarySwitching(&req.mariadb.Status, newPrimaryPodName)
 	}); err != nil {
@@ -201,15 +205,16 @@ func (r *ReplicationReconciler) waitSync(ctx context.Context, req *ReconcileRequ
 }
 
 func (r *ReplicationReconciler) waitForReplicaSync(ctx context.Context, req *ReconcileRequest, logger logr.Logger) error {
-	if req.mariadb.Status.CurrentPrimaryPodIndex == nil {
-		return errors.New("'status.currentPrimaryPodIndex' must be set")
+	primaryPodIndex, err := req.fromPrimaryPodIndex()
+	if err != nil {
+		return err
 	}
 	if !req.currentPrimaryReady {
 		logger.Info("Skipped waiting for replicas to be synced with primary due to primary's non ready status")
 		return nil
 	}
 
-	primaryClient, err := req.replClientSet.currentPrimaryClient(ctx)
+	primaryClient, err := req.replClientSet.clientForIndex(ctx, primaryPodIndex)
 	if err != nil {
 		return fmt.Errorf("error getting current primary client: %v", err)
 	}
@@ -230,7 +235,7 @@ func (r *ReplicationReconciler) waitForReplicaSync(ctx context.Context, req *Rec
 	g.SetLimit(int(req.mariadb.Spec.Replicas))
 
 	for i := 0; i < int(req.mariadb.Spec.Replicas); i++ {
-		if i == *req.mariadb.Status.CurrentPrimaryPodIndex {
+		if i == primaryPodIndex {
 			continue
 		}
 		g.Go(func() error {
@@ -238,6 +243,19 @@ func (r *ReplicationReconciler) waitForReplicaSync(ctx context.Context, req *Rec
 			if err != nil {
 				return fmt.Errorf("error getting replica '%d' client: %v", i, err)
 			}
+
+			// This phase is not naturally re-entrant, and the switchover restarts from the
+			// first phase whenever a later one fails. By then a later phase has repointed
+			// this replica at the new primary and reset its gtid_slave_pos, so it will
+			// never receive the old primary's GTID again — MASTER_GTID_WAIT burns the
+			// whole syncTimeout, the routine restarts, and the loop is unbounded. A
+			// replica that is no longer following this primary cannot be waited on, and
+			// does not need to be: the barrier was passed on the attempt that moved it.
+			if !r.replicaFollowsPrimary(ctx, req, i, primaryPodIndex, logger) {
+				logger.Info("Replica no longer follows this primary, already repointed. Skipping sync wait", "replica", i)
+				return nil
+			}
+
 			logger.V(1).Info("Syncing replica with primary GTID", "replica", i, "gtid", primaryGtid)
 			syncTimeout := ptr.Deref(replication.Replica.SyncTimeout, metav1.Duration{Duration: 10 * time.Second}).Duration
 
@@ -350,8 +368,9 @@ func (r *ReplicationReconciler) configureNewPrimary(ctx context.Context, req *Re
 }
 
 func (r *ReplicationReconciler) connectReplicasToNewPrimary(ctx context.Context, req *ReconcileRequest, logger logr.Logger) error {
-	if req.mariadb.Status.CurrentPrimaryPodIndex == nil {
-		return errors.New("'status.currentPrimaryPodIndex' must be set")
+	oldPrimary, err := req.fromPrimaryPodIndex()
+	if err != nil {
+		return err
 	}
 
 	newPrimary := *ptr.Deref(req.mariadb.Spec.Replication, mariadbv1alpha1.Replication{}).Primary.PodIndex
@@ -369,13 +388,11 @@ func (r *ReplicationReconciler) connectReplicasToNewPrimary(ctx context.Context,
 		return fmt.Errorf("error getting replica options: %v", err)
 	}
 
-	replicationPrimaryPodIndex := ptr.Deref(req.mariadb.Spec.Replication, mariadbv1alpha1.Replication{}).Primary.PodIndex
-
 	g := new(errgroup.Group)
 	g.SetLimit(int(req.mariadb.Spec.Replicas))
 
 	for i := 0; i < int(req.mariadb.Spec.Replicas); i++ {
-		if i == *req.mariadb.Status.CurrentPrimaryPodIndex || i == *replicationPrimaryPodIndex {
+		if i == oldPrimary || i == newPrimary {
 			continue
 		}
 		g.Go(func() error {
@@ -433,16 +450,19 @@ func (r *ReplicationReconciler) connectReplicasToNewPrimary(ctx context.Context,
 }
 
 func (r *ReplicationReconciler) changePrimaryToReplica(ctx context.Context, req *ReconcileRequest, logger logr.Logger) error {
-	if req.mariadb.Status.CurrentPrimaryPodIndex == nil {
-		return errors.New("'status.currentPrimaryPodIndex' must be set")
-	}
 	if !req.currentPrimaryReady {
 		logger.Info("Skipped changing primary to be a replica due to primary's non ready status")
 		return nil
 	}
 
-	currentPrimary := *req.mariadb.Status.CurrentPrimaryPodIndex
-	currentPrimaryClient, err := req.replClientSet.currentPrimaryClient(ctx)
+	// Deliberately not currentPrimaryClient: the promotion has already been committed, so
+	// the status now names the NEW primary and this phase would demote the node it just
+	// promoted.
+	currentPrimary, err := req.fromPrimaryPodIndex()
+	if err != nil {
+		return err
+	}
+	currentPrimaryClient, err := req.replClientSet.clientForIndex(ctx, currentPrimary)
 	if err != nil {
 		return fmt.Errorf("error getting current primary client: %v", err)
 	}
@@ -504,12 +524,22 @@ func (r *ReplicationReconciler) configureReplicaOpts(ctx context.Context, req *R
 	var replicaOpts []ConfigureReplicaOpt
 
 	if req.replicasSynced {
-		primaryBinlogPos, err := primaryClient.GtidBinlogPos(ctx)
+		// gtid_current_pos, not gtid_binlog_pos. log_slave_updates is off in single-cluster
+		// topology, so a node that has been replicating records what it applied in
+		// gtid_slave_pos and nothing of it reaches its own binary log. Read at the moment
+		// of promotion this node is exactly that: gtid_binlog_pos holds only whatever it
+		// wrote locally, which is behind the stream every replica has already consumed.
+		// Handing that out rewinds them, and rewinds the demoted primary past its own
+		// binary log — the assignment MariaDB rejects with error 1947.
+		//
+		// gtid_current_pos is the union of the two, so it is the only reading that means
+		// "everything this node has applied".
+		primaryGtid, err := primaryClient.GtidCurrentPos(ctx)
 		if err != nil {
-			return nil, fmt.Errorf("error getting primary binlog position: %v", err)
+			return nil, fmt.Errorf("error getting primary current position: %v", err)
 		}
-		logger.Info("Configuring replicas with primary GTID", "gtid", primaryBinlogPos)
-		replicaOpts = append(replicaOpts, WithGtidSlavePos(primaryBinlogPos))
+		logger.Info("Configuring replicas with primary GTID", "gtid", primaryGtid)
+		replicaOpts = append(replicaOpts, WithGtidSlavePos(primaryGtid))
 	} else {
 		replicaOpts = append(replicaOpts, WithResetGtidSlavePos())
 	}

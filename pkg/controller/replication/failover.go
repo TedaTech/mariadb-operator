@@ -47,7 +47,7 @@ type candidateOpts struct {
 	requireIOThread bool
 }
 
-// CandidateOpt customises promotion-candidate selection.
+// CandidateOpt customizes promotion-candidate selection.
 type CandidateOpt func(*candidateOpts)
 
 // WithPrimaryDown relaxes the two gates a dead primary necessarily trips.

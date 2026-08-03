@@ -100,6 +100,20 @@ type ReconcileRequest struct {
 	currentPrimaryReady    bool
 	replicasSynced         bool
 	currentPrimaryPodIndex *int // Inferred using MaxScale API, and fallback to MariaDB's status.currentPrimaryPodIndex
+	// switchoverFromPodIndex is the primary a switchover in progress started from.
+	switchoverFromPodIndex *int
+}
+
+// fromPrimaryPodIndex returns the primary a switchover started from, falling back to the
+// status for callers reached outside a switchover.
+func (r *ReconcileRequest) fromPrimaryPodIndex() (int, error) {
+	if r.switchoverFromPodIndex != nil {
+		return *r.switchoverFromPodIndex, nil
+	}
+	if r.mariadb.Status.CurrentPrimaryPodIndex == nil {
+		return 0, errors.New("'status.currentPrimaryPodIndex' must be set")
+	}
+	return *r.mariadb.Status.CurrentPrimaryPodIndex, nil
 }
 
 func (r *ReconcileRequest) Close() error {
@@ -347,6 +361,29 @@ func (r *ReplicationReconciler) ReconcileReplicationInPod(ctx context.Context, r
 	return ctrl.Result{}, nil
 }
 
+// replicaMasterHost returns the host a replica is replicating from, empty when it is not
+// replicating at all.
+func (r *ReplicationReconciler) replicaMasterHost(ctx context.Context, req *ReconcileRequest,
+	podIndex int, pod string, logger logr.Logger) (string, error) {
+	client, err := req.replClientSet.clientForIndex(ctx, podIndex)
+	if err != nil {
+		logger.V(1).Info("error getting replica client to check its primary", "err", err, "pod", pod)
+		return "", err
+	}
+	host, err := client.ReplicaMasterHost(ctx)
+	if err != nil {
+		logger.V(1).Info("error reading replica master host", "err", err, "pod", pod)
+		return "", err
+	}
+	return host, nil
+}
+
+// primaryHost returns the host the operator would configure replicas to follow for a given
+// primary index — the same expression ConfigureReplica uses.
+func (r *ReplicationReconciler) primaryHost(req *ReconcileRequest, primaryPodIndex int) string {
+	return statefulset.PodFQDNWithService(req.mariadb.ObjectMeta, primaryPodIndex, req.mariadb.InternalServiceKey().Name)
+}
+
 // replicaFollowsWrongPrimary reports whether an already-configured replica is
 // replicating from something other than the current primary.
 //
@@ -355,25 +392,36 @@ func (r *ReplicationReconciler) ReconcileReplicationInPod(ctx context.Context, r
 // the only acceptable false answer here is "leave it alone".
 func (r *ReplicationReconciler) replicaFollowsWrongPrimary(ctx context.Context, req *ReconcileRequest,
 	podIndex, primaryPodIndex int, pod string, logger logr.Logger) (bool, error) {
-	client, err := req.replClientSet.clientForIndex(ctx, podIndex)
+	host, err := r.replicaMasterHost(ctx, req, podIndex, pod, logger)
 	if err != nil {
-		logger.V(1).Info("error getting replica client to check its primary", "err", err, "pod", pod)
-		return false, err
-	}
-	host, err := client.ReplicaMasterHost(ctx)
-	if err != nil {
-		logger.V(1).Info("error reading replica master host", "err", err, "pod", pod)
 		return false, err
 	}
 	if host == "" {
 		return false, nil
 	}
-	want := statefulset.PodFQDNWithService(req.mariadb.ObjectMeta, primaryPodIndex, req.mariadb.InternalServiceKey().Name)
+	want := r.primaryHost(req, primaryPodIndex)
 	if host == want {
 		return false, nil
 	}
 	logger.V(1).Info("Replica follows an unexpected primary", "pod", pod, "master", host, "want", want)
 	return true, nil
+}
+
+// replicaFollowsPrimary reports whether a replica is replicating from primaryPodIndex right
+// now.
+//
+// The opposite bias to replicaFollowsWrongPrimary, because it gates a wait rather than a
+// reconfiguration: anything that cannot be determined reports true, and the caller waits
+// exactly as it would have. Only a replica positively observed to be following something
+// else — or nothing at all, which no amount of waiting will change — reports false.
+func (r *ReplicationReconciler) replicaFollowsPrimary(ctx context.Context, req *ReconcileRequest,
+	podIndex, primaryPodIndex int, logger logr.Logger) bool {
+	pod := statefulset.PodName(req.mariadb.ObjectMeta, podIndex)
+	host, err := r.replicaMasterHost(ctx, req, podIndex, pod, logger)
+	if err != nil {
+		return true
+	}
+	return host == r.primaryHost(req, primaryPodIndex)
 }
 
 func (r *ReplicationReconciler) getReplicaOpts(ctx context.Context, req *ReconcileRequest, pod string, index int,
@@ -382,6 +430,7 @@ func (r *ReplicationReconciler) getReplicaOpts(ctx context.Context, req *Reconci
 	for _, setOpt := range reconcilePodOpts {
 		setOpt(&opts)
 	}
+
 	if !opts.forceReplicaConfiguration {
 		return nil, nil
 	}
