@@ -8,12 +8,12 @@ and nothing at all occurs. No promotion, no event, no non-verbose log line.
 It now carries a second, unrelated fix: **`spec.archiveTimeout` does not bound
 anything**, so point-in-time recovery has an unbounded RPO. See commit 7.
 
-Base: upstream tag `v26.3.0`. Working branch: `teda/26.3.0`.
-Image: `ghcr.io/tedatech/mariadb-operator:26.3.0-teda.N`.
+Base: upstream tag `v26.6.0`. Working branch: `teda/26.6.0`.
+Image: `ghcr.io/tedatech/mariadb-operator:26.6.0-teda.N`.
 
 Everything here is a bug fix against upstream behaviour. There are no new API
 fields, no CRD changes, and no new configuration — the CRDs from upstream
-`26.3.0` are used unmodified.
+`26.6.0` are used unmodified.
 
 ## The one cause
 
@@ -91,7 +91,23 @@ kind, 5 nodes, k8s v1.35, 3-replica MariaDB with `autoFailover: true`, then
 | upstream `26.3.0`, after 7 min | no | **0** | no — both survivors `read_only=1` |
 | this fork | yes, in **17s** | yes | yes |
 
-Upgrading is not a fix: `26.6.0` is the newest tag and #1846 is filed against it.
+Upgrading is not a fix. Every one of the seven defects was re-verified against
+`26.6.0` when this branch was rebased onto it on 2026-08-03:
+
+| Defect | Status in `26.6.0` |
+|---|---|
+| 1 failover candidate selection | `pkg/controller/replication/failover.go` is **byte-identical** to `26.3.0` |
+| 2 `waitForNewPrimarySync` re-entrancy | unchanged logic; #1654 still closed `not_planned` |
+| 3 reconnect replicas whose primary is gone | still gated on Pod readiness |
+| 4 role inference | still reports `Unknown` for a primary with no connected replicas; `26.6.0` only added the multi-cluster `PrimaryReplica` case |
+| 5 replica following a dead primary | the early return on `role == Replica` is **verbatim** |
+| 6 `read_only` re-assertion | same early return, same gap |
+| 7 `archiveTimeout` | `pkg/binlog/archiver.go` is **byte-identical** to `26.3.0` |
+
+What `26.6.0` did change in this area is a refactor: `replConfigClient` became
+`topologyManager.TopologyForMariaDB(...)`. Patches 2–6 were re-applied against
+it; 4 moved into the extracted `getReplicationRole` helper, which now takes
+`podIndex` directly.
 
 **Known gap.** The drill fixture had no `PhysicalBackup`, so after reattachment
 the replicas hit `Error 1236 ... GTID not in the master's binlog` — the promotion
