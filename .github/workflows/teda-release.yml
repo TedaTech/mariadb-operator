@@ -50,7 +50,10 @@ jobs:
           context: .
           file: ./Dockerfile
           platforms: linux/amd64
-          tags: ghcr.io/${{ github.repository_owner }}/mariadb-operator:${{ github.ref_name }}
+          # Literal, not ${{ github.repository_owner }}: the org is spelled
+          # "TedaTech" and OCI repository names must be lowercase, so the
+          # expansion produces an invalid tag.
+          tags: ghcr.io/tedatech/mariadb-operator:${{ github.ref_name }}
           labels: |
             org.opencontainers.image.title=mariadb-operator
             org.opencontainers.image.description=TeDa Tech fork of mariadb-operator with automatic-failover fixes
