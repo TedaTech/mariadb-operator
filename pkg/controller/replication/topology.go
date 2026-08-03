@@ -182,7 +182,30 @@ func (r *singleClusterTopology) ConfigureReplica(ctx context.Context, client *sq
 	}
 	if opts.GtidSlavePos != nil {
 		if err := client.SetGtidSlavePos(ctx, *opts.GtidSlavePos); err != nil {
-			return fmt.Errorf("error setting slave position %s: %v", *opts.GtidSlavePos, err)
+			// The counterpart of the 1948 tolerance in ConfigurePrimary, for the other
+			// direction and the other call site. Whenever ResetMaster is suppressed —
+			// which point-in-time recovery does unconditionally, so that archival does
+			// not lose binary logs — this node keeps a binary log that may already be
+			// ahead of the position being assigned. A demoted primary always is: it was
+			// the one accepting writes, and log_slave_updates is off in single-cluster
+			// topology, so the new primary's gtid_binlog_pos does not include them.
+			//
+			// Under MASTER_USE_GTID=current_pos the server replicates from the union of
+			// gtid_binlog_pos and gtid_slave_pos, so the binary log position wins and the
+			// assignment was redundant — which is what the error message itself says.
+			// Under slave_pos it is not redundant, and swallowing it would silently
+			// resume replication from a stale position, so there it must still fail.
+			deferToBinlog, gtidErr := r.defersToBinlogPos(opts)
+			if gtidErr != nil {
+				return fmt.Errorf("error resolving replica GTID mode: %v", gtidErr)
+			}
+			if !deferToBinlog || !sql.IsGtidSlavePosBehindBinlog(err) {
+				return fmt.Errorf("error setting slave position %s: %v", *opts.GtidSlavePos, err)
+			}
+			r.logger.Info(
+				"gtid_slave_pos is behind this node's binary log, deferring to the binlog position",
+				"gtid", *opts.GtidSlavePos,
+			)
 		}
 	} else if opts.ResetGtidSlavePos {
 		if err := client.ResetGtidSlavePos(ctx); err != nil {
@@ -199,6 +222,34 @@ func (r *singleClusterTopology) ConfigureReplica(ctx context.Context, client *sq
 		return fmt.Errorf("error starting slave: %v", err)
 	}
 	return nil
+}
+
+// defersToBinlogPos reports whether this replica will be told to replicate from
+// current_pos, in which case the server merges gtid_binlog_pos with gtid_slave_pos and a
+// gtid_slave_pos that is behind the binary log has no effect on where replication resumes.
+//
+// It resolves the mode exactly as changeMaster does — the CR's replica.gtid first, then any
+// ChangeMasterOpts overriding it — because that is the value the server will actually be
+// given. getReplicaOpts forces slave_pos on the recovery path, and that override has to win
+// here too, or a replica rebuilt from a backup would silently resume from a stale position.
+func (r *singleClusterTopology) defersToBinlogPos(opts ConfigureReplicaOpts) (bool, error) {
+	replication := ptr.Deref(r.mariadb.Spec.Replication, mariadbv1alpha1.Replication{})
+	gtid := ptr.Deref(replication.Replica.Gtid, mariadbv1alpha1.GtidCurrentPos)
+	gtidString, err := gtid.MariaDBFormat()
+	if err != nil {
+		return false, err
+	}
+
+	resolved := sql.ChangeMasterOpts{Gtid: gtidString}
+	for _, setOpt := range opts.ChangeMasterOpts {
+		setOpt(&resolved)
+	}
+
+	currentPos, err := mariadbv1alpha1.GtidCurrentPos.MariaDBFormat()
+	if err != nil {
+		return false, err
+	}
+	return resolved.Gtid == currentPos, nil
 }
 
 func (r *singleClusterTopology) changeMaster(ctx context.Context, mariadb *mariadbv1alpha1.MariaDB, client *sql.Client,

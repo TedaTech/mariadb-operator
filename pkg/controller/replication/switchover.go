@@ -24,6 +24,9 @@ import (
 type switchoverPhase struct {
 	name      string
 	reconcile func(context.Context, *ReconcileRequest, logr.Logger) error
+	// commitsPromotion marks the phase after which the new primary is writable and the
+	// switchover can no longer be undone. See reconcileSwitchover.
+	commitsPromotion bool
 }
 
 func isSwitchoverStale(mdb *mariadbv1alpha1.MariaDB) bool {
@@ -38,6 +41,39 @@ func shouldReconcileSwitchover(mdb *mariadbv1alpha1.MariaDB) bool {
 		return false
 	}
 	return mdb.IsReplicationSwitchoverRequired()
+}
+
+// switchoverPhases returns the ordered steps of a primary switchover. Phases up to and
+// including the one marked commitsPromotion establish the new primary; those after it
+// reattach the rest of the topology to it.
+func (r *ReplicationReconciler) switchoverPhases() []switchoverPhase {
+	return []switchoverPhase{
+		{
+			name:      "Lock primary with read lock",
+			reconcile: r.lockPrimaryWithReadLock,
+		},
+		{
+			name:      "Set read_only in primary",
+			reconcile: r.setPrimaryReadOnly,
+		},
+		{
+			name:      "Wait sync",
+			reconcile: r.waitSync,
+		},
+		{
+			name:             "Configure new primary",
+			reconcile:        r.configureNewPrimary,
+			commitsPromotion: true,
+		},
+		{
+			name:      "Connect replicas to new primary",
+			reconcile: r.connectReplicasToNewPrimary,
+		},
+		{
+			name:      "Change primary to replica",
+			reconcile: r.changePrimaryToReplica,
+		},
+	}
 }
 
 func (r *ReplicationReconciler) reconcileSwitchover(ctx context.Context, req *ReconcileRequest, switchoverLogger logr.Logger) error {
@@ -62,58 +98,54 @@ func (r *ReplicationReconciler) reconcileSwitchover(ctx context.Context, req *Re
 	newPrimaryPodName := statefulset.PodName(req.mariadb.ObjectMeta, *replication.Primary.PodIndex)
 	logger = logger.WithValues("primary", primary, "new-primary", newPrimary)
 
+	// Pin the primary this switchover started from. The promotion is committed to status
+	// midway through the phases below, after which Status.CurrentPrimaryPodIndex names the
+	// NEW primary — but the remaining phases still have to act on the old one, so they read
+	// this instead of the status.
+	req.switchoverFromPodIndex = primary
+
 	if err := r.patchStatus(ctx, req.mariadb, func(status *mariadbv1alpha1.MariaDBStatus) {
 		condition.SetPrimarySwitching(&req.mariadb.Status, newPrimaryPodName)
 	}); err != nil {
 		return fmt.Errorf("error patching MariaDB status: %v", err)
 	}
 
-	phases := []switchoverPhase{
-		{
-			name:      "Lock primary with read lock",
-			reconcile: r.lockPrimaryWithReadLock,
-		},
-		{
-			name:      "Set read_only in primary",
-			reconcile: r.setPrimaryReadOnly,
-		},
-		{
-			name:      "Wait sync",
-			reconcile: r.waitSync,
-		},
-		{
-			name:      "Configure new primary",
-			reconcile: r.configureNewPrimary,
-		},
-		{
-			name:      "Connect replicas to new primary",
-			reconcile: r.connectReplicasToNewPrimary,
-		},
-		{
-			name:      "Change primary to replica",
-			reconcile: r.changePrimaryToReplica,
-		},
-	}
-
-	for _, p := range phases {
+	// The promotion is committed to status as soon as the new primary is writable, not
+	// after every phase has succeeded.
+	//
+	// The primary Service selector is built from Status.CurrentPrimaryPodIndex, so until
+	// that field moves, traffic keeps going to the old primary — which phase 2 has just set
+	// read_only on, and which only the LAST phase would ever unset. Committing at the end
+	// therefore means any failure in the phases after the promotion takes writes down for
+	// as long as it persists, even though a healthy writable primary already exists. That
+	// is what happened on 2026-08-03: error 1947 in the final phase left a promoted,
+	// writable mdb-0 unused for 25 minutes while the Service pointed at a read-only mdb-1.
+	//
+	// The phases after the commit reattach replicas and demote the old primary. They are
+	// convergence work, retried by the steady-state reconcile if they fail here, and none
+	// of them makes the promotion any more or less true.
+	for _, p := range r.switchoverPhases() {
 		if err := p.reconcile(ctx, req, logger.WithValues("phase", p.name)); err != nil {
 			if apierrors.IsNotFound(err) {
 				return err
 			}
 			return fmt.Errorf("error in %s switchover reconcile phase: %v", p.name, err)
 		}
+		if !p.commitsPromotion {
+			continue
+		}
+		if err := r.patchStatus(ctx, req.mariadb, func(status *mariadbv1alpha1.MariaDBStatus) {
+			status.UpdateCurrentPrimary(req.mariadb, newPrimary)
+			condition.SetPrimarySwitched(&req.mariadb.Status)
+		}); err != nil {
+			return fmt.Errorf("error patching MariaDB status: %v", err)
+		}
+
+		logger.Info("Primary switched")
+		r.recorder.Eventf(req.mariadb, nil, corev1.EventTypeNormal, mariadbv1alpha1.ReasonPrimarySwitched,
+			mariadbv1alpha1.ActionReconciling, "Primary switched from index '%d' to index '%d'", *primary, newPrimary)
 	}
 
-	if err := r.patchStatus(ctx, req.mariadb, func(status *mariadbv1alpha1.MariaDBStatus) {
-		status.UpdateCurrentPrimary(req.mariadb, newPrimary)
-		condition.SetPrimarySwitched(&req.mariadb.Status)
-	}); err != nil {
-		return fmt.Errorf("error patching MariaDB status: %v", err)
-	}
-
-	logger.Info("Primary switched")
-	r.recorder.Eventf(req.mariadb, nil, corev1.EventTypeNormal, mariadbv1alpha1.ReasonPrimarySwitched,
-		mariadbv1alpha1.ActionReconciling, "Primary switched from index '%d' to index '%d'", *primary, newPrimary)
 	return nil
 }
 
@@ -193,15 +225,16 @@ func (r *ReplicationReconciler) waitSync(ctx context.Context, req *ReconcileRequ
 }
 
 func (r *ReplicationReconciler) waitForReplicaSync(ctx context.Context, req *ReconcileRequest, logger logr.Logger) error {
-	if req.mariadb.Status.CurrentPrimaryPodIndex == nil {
-		return errors.New("'status.currentPrimaryPodIndex' must be set")
+	primaryPodIndex, err := req.fromPrimaryPodIndex()
+	if err != nil {
+		return err
 	}
 	if !req.currentPrimaryReady {
 		logger.Info("Skipped waiting for replicas to be synced with primary due to primary's non ready status")
 		return nil
 	}
 
-	primaryClient, err := req.replClientSet.currentPrimaryClient(ctx)
+	primaryClient, err := req.replClientSet.clientForIndex(ctx, primaryPodIndex)
 	if err != nil {
 		return fmt.Errorf("error getting current primary client: %v", err)
 	}
@@ -222,7 +255,7 @@ func (r *ReplicationReconciler) waitForReplicaSync(ctx context.Context, req *Rec
 	g.SetLimit(int(req.mariadb.Spec.Replicas))
 
 	for i := 0; i < int(req.mariadb.Spec.Replicas); i++ {
-		if i == *req.mariadb.Status.CurrentPrimaryPodIndex {
+		if i == primaryPodIndex {
 			continue
 		}
 		g.Go(func() error {
@@ -230,6 +263,19 @@ func (r *ReplicationReconciler) waitForReplicaSync(ctx context.Context, req *Rec
 			if err != nil {
 				return fmt.Errorf("error getting replica '%d' client: %v", i, err)
 			}
+
+			// This phase is not naturally re-entrant, and the switchover restarts from the
+			// first phase whenever a later one fails. By then a later phase has repointed
+			// this replica at the new primary and reset its gtid_slave_pos, so it will
+			// never receive the old primary's GTID again — MASTER_GTID_WAIT burns the
+			// whole syncTimeout, the routine restarts, and the loop is unbounded. A
+			// replica that is no longer following this primary cannot be waited on, and
+			// does not need to be: the barrier was passed on the attempt that moved it.
+			if !r.replicaFollowsPrimary(ctx, req, i, primaryPodIndex, logger) {
+				logger.Info("Replica no longer follows this primary, already repointed. Skipping sync wait", "replica", i)
+				return nil
+			}
+
 			logger.V(1).Info("Syncing replica with primary GTID", "replica", i, "gtid", primaryGtid)
 			syncTimeout := ptr.Deref(replication.Replica.SyncTimeout, metav1.Duration{Duration: 10 * time.Second}).Duration
 
@@ -342,8 +388,9 @@ func (r *ReplicationReconciler) configureNewPrimary(ctx context.Context, req *Re
 }
 
 func (r *ReplicationReconciler) connectReplicasToNewPrimary(ctx context.Context, req *ReconcileRequest, logger logr.Logger) error {
-	if req.mariadb.Status.CurrentPrimaryPodIndex == nil {
-		return errors.New("'status.currentPrimaryPodIndex' must be set")
+	oldPrimary, err := req.fromPrimaryPodIndex()
+	if err != nil {
+		return err
 	}
 
 	newPrimary := *ptr.Deref(req.mariadb.Spec.Replication, mariadbv1alpha1.Replication{}).Primary.PodIndex
@@ -361,13 +408,11 @@ func (r *ReplicationReconciler) connectReplicasToNewPrimary(ctx context.Context,
 		return fmt.Errorf("error getting replica options: %v", err)
 	}
 
-	replicationPrimaryPodIndex := ptr.Deref(req.mariadb.Spec.Replication, mariadbv1alpha1.Replication{}).Primary.PodIndex
-
 	g := new(errgroup.Group)
 	g.SetLimit(int(req.mariadb.Spec.Replicas))
 
 	for i := 0; i < int(req.mariadb.Spec.Replicas); i++ {
-		if i == *req.mariadb.Status.CurrentPrimaryPodIndex || i == *replicationPrimaryPodIndex {
+		if i == oldPrimary || i == newPrimary {
 			continue
 		}
 		g.Go(func() error {
@@ -425,16 +470,19 @@ func (r *ReplicationReconciler) connectReplicasToNewPrimary(ctx context.Context,
 }
 
 func (r *ReplicationReconciler) changePrimaryToReplica(ctx context.Context, req *ReconcileRequest, logger logr.Logger) error {
-	if req.mariadb.Status.CurrentPrimaryPodIndex == nil {
-		return errors.New("'status.currentPrimaryPodIndex' must be set")
-	}
 	if !req.currentPrimaryReady {
 		logger.Info("Skipped changing primary to be a replica due to primary's non ready status")
 		return nil
 	}
 
-	currentPrimary := *req.mariadb.Status.CurrentPrimaryPodIndex
-	currentPrimaryClient, err := req.replClientSet.currentPrimaryClient(ctx)
+	// Deliberately not currentPrimaryClient: the promotion has already been committed, so
+	// the status now names the NEW primary and this phase would demote the node it just
+	// promoted.
+	currentPrimary, err := req.fromPrimaryPodIndex()
+	if err != nil {
+		return err
+	}
+	currentPrimaryClient, err := req.replClientSet.clientForIndex(ctx, currentPrimary)
 	if err != nil {
 		return fmt.Errorf("error getting current primary client: %v", err)
 	}
@@ -483,12 +531,22 @@ func (r *ReplicationReconciler) configureReplicaOpts(ctx context.Context, req *R
 	var replicaOpts []ConfigureReplicaOpt
 
 	if req.replicasSynced {
-		primaryBinlogPos, err := primaryClient.GtidBinlogPos(ctx)
+		// gtid_current_pos, not gtid_binlog_pos. log_slave_updates is off in single-cluster
+		// topology, so a node that has been replicating records what it applied in
+		// gtid_slave_pos and nothing of it reaches its own binary log. Read at the moment
+		// of promotion this node is exactly that: gtid_binlog_pos holds only whatever it
+		// wrote locally, which is behind the stream every replica has already consumed.
+		// Handing that out rewinds them, and rewinds the demoted primary past its own
+		// binary log — the assignment MariaDB rejects with error 1947.
+		//
+		// gtid_current_pos is the union of the two, so it is the only reading that means
+		// "everything this node has applied".
+		primaryGtid, err := primaryClient.GtidCurrentPos(ctx)
 		if err != nil {
-			return nil, fmt.Errorf("error getting primary binlog position: %v", err)
+			return nil, fmt.Errorf("error getting primary current position: %v", err)
 		}
-		logger.Info("Configuring replicas with primary GTID", "gtid", primaryBinlogPos)
-		replicaOpts = append(replicaOpts, WithGtidSlavePos(primaryBinlogPos))
+		logger.Info("Configuring replicas with primary GTID", "gtid", primaryGtid)
+		replicaOpts = append(replicaOpts, WithGtidSlavePos(primaryGtid))
 	} else {
 		replicaOpts = append(replicaOpts, WithResetGtidSlavePos())
 	}
