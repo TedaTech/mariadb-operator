@@ -1,9 +1,12 @@
 # TeDa Tech fork of mariadb-operator
 
-This fork exists for one reason: **on upstream `26.3.0`, automatic primary
+This fork started for one reason: **on upstream `26.3.0`, automatic primary
 failover does not happen.** Not "happens slowly", not "happens with a warning" —
 the node hosting the primary dies, `autoFailover` is enabled, the delay elapses,
 and nothing at all occurs. No promotion, no event, no non-verbose log line.
+
+It now carries a second, unrelated fix: **`spec.archiveTimeout` does not bound
+anything**, so point-in-time recovery has an unbounded RPO. See commit 7.
 
 Base: upstream tag `v26.3.0`. Working branch: `teda/26.3.0`.
 Image: `ghcr.io/tedatech/mariadb-operator:26.3.0-teda.N`.
@@ -38,10 +41,45 @@ the nil check returns before the threshold is ever compared.
 | 4 | `fix(status): infer Primary from currentPrimaryPodIndex` | not filed |
 | 5 | `fix(replication): repair a replica following a dead primary` | not filed |
 | 6 | `fix(replication): re-assert read_only on replicas every reconcile` | [#1719](https://github.com/mariadb-operator/mariadb-operator/issues/1719) |
+| 7 | `fix(binlog): rotate the active binary log when archival is overdue` | not filed |
 
 Commits 1 and 3 are the two that make failover complete at all. 5 and 6 are the
 ones that act in steady state on a healthy cluster — check those first if a
-rebase misbehaves.
+rebase misbehaves. 7 is independent of the other six.
+
+### 7 — `archiveTimeout` does not bound the RPO
+
+Separate defect, separate subsystem, same shape: a knob whose name promises
+something the code never delivers.
+
+`archiveBinaryLogs` deliberately drops the active binary log from the list it
+ships (`pkg/binlog/archiver.go`, `binlogs = binlogs[:len(binlogs)-1]`), and
+**nothing in the operator or the agent ever issues `FLUSH BINARY LOGS`**.
+`spec.archiveTimeout` is only a `context.WithTimeout` on the upload. So binary
+logs reach object storage only when MariaDB rotates on its own — at
+`max_binlog_size` (1 GiB by default) or on restart. Everything written since the
+last rotation is unrecoverable, for an unbounded period.
+
+It is worse than a plain outage because it looks healthy. A no-op cycle still
+logs `Archiving binary logs` and `Binlog archival done`; the "already archived"
+and "object exists" skips are both at `V(1)`. Observed in production 2026-08-03:
+`BinlogsArchived=True`, a successful cycle logged every 10 minutes, and
+`lastArchivedTime` two days old on `…-bin.000001` at position 374 — a binary log
+containing no transactions at all.
+
+The fix rotates the active binary log when the time since `lastArchivedTime`
+exceeds `archiveTimeout`, which makes the field mean what it says. Rotation is
+guarded on `@@gtid_binlog_pos` having moved since this archiver last rotated:
+MariaDB rotates unconditionally, so an idle primary would otherwise accumulate
+one empty binary log per interval forever.
+
+Only the primary runs the archiver (`shouldArchiveBinlogs` returns early on
+replicas), so this issues no SQL anywhere else.
+
+**Config-only fallback if this is ever dropped:** a small `max_binlog_size` in
+`spec.myCnf`. That ties the RPO to write volume instead of time, which is
+strictly worse — a quiet database gets the worst coverage — but it needs no
+patched image.
 
 ## Evidence
 
