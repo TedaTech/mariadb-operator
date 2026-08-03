@@ -260,6 +260,24 @@ func (r *ReplicationReconciler) waitForNewPrimarySync(ctx context.Context, req *
 		return fmt.Errorf("error getting new primary client: %v", err)
 	}
 
+	// This phase is not naturally re-entrant, and the switchover routine is
+	// restarted from the beginning whenever a later phase fails or syncTimeout
+	// expires. configureNewPrimary, which runs next, stops and resets all slaves
+	// on this Pod — so on the second pass through there is no replica status
+	// left to read, HasRelayLogEvents fails on a nil GTID IO position, the poll
+	// never succeeds, and the routine restarts again. That loop is unbounded:
+	// the Pod parks in `status.replication.roles: Unknown` and the switchover
+	// never completes. A node that is no longer a replica has, by definition,
+	// no relay log left to apply, so there is nothing to wait for.
+	isReplica, err := newPrimaryClient.IsReplicationReplica(ctx)
+	if err != nil {
+		return fmt.Errorf("error checking whether new primary is still a replica: %v", err)
+	}
+	if !isReplica {
+		logger.Info("New primary is no longer a replica, already promoted. Skipping sync wait")
+		return nil
+	}
+
 	logger.Info("Waiting for new primary to be synced")
 	r.recorder.Eventf(req.mariadb, nil, corev1.EventTypeNormal, mariadbv1alpha1.ReasonReplicationPrimaryNewSync,
 		mariadbv1alpha1.ActionReconciling, "Waiting for new primary to be synced")
@@ -272,6 +290,15 @@ func (r *ReplicationReconciler) waitForNewPrimarySync(ctx context.Context, req *
 		status, err := newPrimaryClient.ReplicaStatus(ctx, logger)
 		if err != nil {
 			return fmt.Errorf("error getting new primary status: %v", err)
+		}
+		// SHOW REPLICA STATUS returned no rows, so every field is nil. Either
+		// replication was torn down since the check above, or the IO thread
+		// never received anything; both mean an empty relay log. Without this
+		// the poll would burn the whole syncTimeout on HasRelayLogEvents
+		// rejecting the nil GTID IO position, and restart the routine.
+		if status.GtidIOPos == nil && status.GtidCurrentPos == nil {
+			logger.Info("New primary reports no replica status, nothing to sync")
+			return nil
 		}
 		gtidDomainId, err := newPrimaryClient.GtidDomainId(ctx)
 		if err != nil {
