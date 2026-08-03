@@ -43,6 +43,9 @@ const (
 	ReasonPrimarySwitching = "PrimarySwitching"
 	// ReasonPrimarySwitched indicates that primary has been switched.
 	ReasonPrimarySwitched = "PrimarySwitched"
+	// ReasonPrimarySwitchNoCandidates indicates that an automatic failover was
+	// skipped because no replica qualified for promotion.
+	ReasonPrimarySwitchNoCandidates = "PrimarySwitchNoCandidates"
 
 	// ReasonMaxScalePrimaryServerChanged indicates that the primary server managed by MaxScale has changed.
 	ReasonMaxScalePrimaryServerChanged = "MaxScalePrimaryServerChanged"
