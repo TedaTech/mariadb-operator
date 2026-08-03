@@ -838,6 +838,13 @@ func (c *Client) BinaryLogIndex(ctx context.Context) (string, error) {
 	return c.SystemVariable(ctx, "log_bin_index")
 }
 
+// FlushBinaryLogs closes the active binary log and opens a new one. The archiver
+// never ships the active binary log, so without a rotation everything written
+// since the last one is unarchivable.
+func (c *Client) FlushBinaryLogs(ctx context.Context) error {
+	return c.Exec(ctx, "FLUSH BINARY LOGS;")
+}
+
 func (c *Client) GtidBinlogPos(ctx context.Context) (string, error) {
 	return c.SystemVariable(ctx, "gtid_binlog_pos")
 }

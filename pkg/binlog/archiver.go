@@ -47,6 +47,14 @@ type Archiver struct {
 	refResolver *refresolver.RefResolver
 	recorder    events.EventRecorder
 	logger      logr.Logger
+
+	// lastRotatedBinlogPos is @@gtid_binlog_pos as observed the last time this
+	// archiver rotated the binary log. It exists to keep rotateStaleBinlog from
+	// rotating an idle server once per archive timeout forever: MariaDB rotates
+	// unconditionally on FLUSH BINARY LOGS, so without this an idle primary
+	// would accumulate one empty binary log per interval. In-memory on purpose —
+	// losing it on an agent restart costs at most one redundant rotation.
+	lastRotatedBinlogPos string
 }
 
 func NewArchiver(dataDir string, env *environment.PodEnvironment, client client.Client,
@@ -174,6 +182,10 @@ func (a *Archiver) archiveBinaryLogs(ctx context.Context, mdb *mariadbv1alpha1.M
 		return fmt.Errorf("error getting SQL client: %v", err)
 	}
 	defer sqlClient.Close()
+
+	if err := a.rotateStaleBinlog(ctx, mdb, pitr, sqlClient); err != nil {
+		return fmt.Errorf("error rotating stale binary log: %v", err)
+	}
 
 	binlogs, err := a.getBinaryLogs(ctx, sqlClient)
 	if err != nil {
@@ -358,6 +370,66 @@ func (a *Archiver) physicalBackupConfigured(ctx context.Context, ref *mariadbv1a
 		return false, err
 	}
 	return true, nil
+}
+
+// rotateStaleBinlog closes the active binary log once it has been holding
+// unarchived transactions for longer than the configured archive timeout.
+//
+// Without this, archiveTimeout does not bound anything an operator cares about.
+// archiveBinaryLogs deliberately never ships the active binary log, and nothing
+// else in the operator rotates, so binary logs only ever reach object storage
+// when MariaDB rotates on its own — at max_binlog_size (1 GiB by default) or on
+// restart. Everything written since the last rotation is unrecoverable, and on a
+// low-write database that window is days, not the hour the spec field implies.
+// Observed in production: a cluster reporting BinlogsArchived=True, logging a
+// successful archival cycle every 10 minutes, with a recovery point two days old.
+//
+// The guard is @@gtid_binlog_pos rather than a timestamp: an idle primary must
+// not be rotated once per interval forever, because MariaDB rotates
+// unconditionally and each rotation leaves another empty binary log behind.
+func (a *Archiver) rotateStaleBinlog(ctx context.Context, mdb *mariadbv1alpha1.MariaDB,
+	pitr *mariadbv1alpha1.PointInTimeRecovery, sqlClient *sql.Client) error {
+	archiveTimeout := ptr.Deref(pitr.Spec.ArchiveTimeout, defaultArchivalTimeout).Duration
+
+	binlogPos, err := sqlClient.GtidBinlogPos(ctx)
+	if err != nil {
+		return fmt.Errorf("error getting binary log GTID position: %v", err)
+	}
+
+	if !shouldRotateBinlog(mdb.Status.PointInTimeRecovery, archiveTimeout, binlogPos, a.lastRotatedBinlogPos, time.Now()) {
+		a.logger.V(1).Info("Binary log rotation not due. Skipping...", "binlog-pos", binlogPos)
+		return nil
+	}
+
+	a.logger.Info(
+		"Active binary log holds unarchived transactions older than the archive timeout. Rotating...",
+		"archive-timeout", archiveTimeout,
+		"binlog-pos", binlogPos,
+	)
+	if err := sqlClient.FlushBinaryLogs(ctx); err != nil {
+		return fmt.Errorf("error flushing binary logs: %v", err)
+	}
+	a.lastRotatedBinlogPos = binlogPos
+
+	return nil
+}
+
+// shouldRotateBinlog decides whether the active binary log has been holding
+// unarchived transactions for longer than the archive timeout.
+func shouldRotateBinlog(status *mariadbv1alpha1.MariaDBPointInTimeRecoveryStatus, archiveTimeout time.Duration,
+	binlogPos, lastRotatedBinlogPos string, now time.Time) bool {
+	// Nothing has ever been written, or nothing since this archiver last
+	// rotated. Rotating again would only leave another empty binary log behind.
+	if binlogPos == "" || binlogPos == lastRotatedBinlogPos {
+		return false
+	}
+	// An archival within the timeout means the RPO is already inside its bound;
+	// let MariaDB rotate on its own terms. A status with no LastArchivedTime has
+	// never archived, so it is always due.
+	if status != nil && !status.LastArchivedTime.IsZero() && now.Sub(status.LastArchivedTime.Time) < archiveTimeout {
+		return false
+	}
+	return true
 }
 
 func (a *Archiver) getBinaryLogs(ctx context.Context, sqlClient *sql.Client) ([]string, error) {
