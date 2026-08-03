@@ -255,7 +255,16 @@ func (r *ReplicationReconciler) ReconcileReplicationInPod(ctx context.Context, r
 	if !opts.forceReplicaConfiguration {
 		role, ok := replRoles[pod]
 		if ok && role == mariadbv1alpha1.ReplicationRoleReplica {
-			return ctrl.Result{}, nil
+			// "Replica" says nothing about WHICH primary this Pod follows. A
+			// replica left pointing at a primary that no longer exists still
+			// reports Slave_SQL_Running=Yes and stays classified Replica
+			// forever, so this early return is the reason a survivor of a
+			// failover has to be reattached by hand. Re-point it instead.
+			stale, err := r.replicaFollowsWrongPrimary(ctx, req, podIndex, primaryPodIndex, pod, logger)
+			if err != nil || !stale {
+				return ctrl.Result{}, nil
+			}
+			logger.Info("Replica follows a stale primary, reconfiguring", "pod", pod)
 		}
 	}
 
@@ -273,6 +282,35 @@ func (r *ReplicationReconciler) ReconcileReplicationInPod(ctx context.Context, r
 		return ctrl.Result{}, fmt.Errorf("error configuring replica: %v", err)
 	}
 	return ctrl.Result{}, nil
+}
+
+// replicaFollowsWrongPrimary reports whether an already-configured replica is
+// replicating from something other than the current primary.
+//
+// Deliberately conservative: any error, and any empty Master_Host, reports
+// false. Reconfiguring a replica resets its binlog and restarts replication, so
+// the only acceptable false answer here is "leave it alone".
+func (r *ReplicationReconciler) replicaFollowsWrongPrimary(ctx context.Context, req *ReconcileRequest,
+	podIndex, primaryPodIndex int, pod string, logger logr.Logger) (bool, error) {
+	client, err := req.replClientSet.clientForIndex(ctx, podIndex)
+	if err != nil {
+		logger.V(1).Info("error getting replica client to check its primary", "err", err, "pod", pod)
+		return false, err
+	}
+	host, err := client.ReplicaMasterHost(ctx)
+	if err != nil {
+		logger.V(1).Info("error reading replica master host", "err", err, "pod", pod)
+		return false, err
+	}
+	if host == "" {
+		return false, nil
+	}
+	want := statefulset.PodFQDNWithService(req.mariadb.ObjectMeta, primaryPodIndex, req.mariadb.InternalServiceKey().Name)
+	if host == want {
+		return false, nil
+	}
+	logger.V(1).Info("Replica follows an unexpected primary", "pod", pod, "master", host, "want", want)
+	return true, nil
 }
 
 func (r *ReplicationReconciler) getReplicaOpts(ctx context.Context, req *ReconcileRequest, pod string, index int,
