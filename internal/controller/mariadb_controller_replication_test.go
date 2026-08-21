@@ -6,6 +6,8 @@ import (
 	volumesnapshotv1 "github.com/kubernetes-csi/external-snapshotter/client/v8/apis/volumesnapshot/v1"
 	mariadbv1alpha1 "github.com/mariadb-operator/mariadb-operator/v26/api/v1alpha1"
 	"github.com/mariadb-operator/mariadb-operator/v26/pkg/metadata"
+	"github.com/mariadb-operator/mariadb-operator/v26/pkg/refresolver"
+	"github.com/mariadb-operator/mariadb-operator/v26/pkg/sql"
 	stsobj "github.com/mariadb-operator/mariadb-operator/v26/pkg/statefulset"
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
@@ -216,6 +218,25 @@ var _ = Describe("MariaDB replication", Ordered, func() {
 			}
 			return *mdb.Status.CurrentPrimaryPodIndex == podIndex
 		}, testTimeout, testInterval).Should(BeTrue())
+
+		By("Expecting the new primary to be writable")
+		// Regression gate for the promotion path: a new primary that is configured while
+		// still holding read_only=ON is committed anyway and the cluster keeps serving
+		// reads from a primary that rejects writes. A tolerated ResetGtidSlavePos error
+		// must fall through to DisableReadOnly, and a postcondition failure must keep the
+		// promotion uncommitted until a retry succeeds.
+		Eventually(func() bool {
+			primaryClient, err := sql.NewInternalClientWithPodIndex(testCtx, mdb, refresolver.New(k8sClient), podIndex)
+			if err != nil {
+				return false
+			}
+			defer primaryClient.Close()
+			isReadOnly, err := primaryClient.GetReadOnly(testCtx)
+			if err != nil {
+				return false
+			}
+			return !isReadOnly
+		}, testHighTimeout, testInterval).Should(BeTrue())
 
 		By("Expecting primary Service to eventually change primary")
 		Eventually(func() bool {

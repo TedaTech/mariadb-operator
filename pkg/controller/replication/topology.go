@@ -146,10 +146,20 @@ func (r *singleClusterTopology) ConfigurePrimary(ctx context.Context, client *sq
 			// replication domain 0. This conflicts with the binary log which contains GTID
 			// 0-11-1176. If MASTER_GTID_POS=CURRENT_POS is used, the binlog position will
 			// override the new value of @@gtid_slave_pos'
+			//
+			// The assignment this error refuses is redundant — the server merges
+			// gtid_binlog_pos into the position it replicates from under current_pos — but
+			// the rest of the promotion is not. An early return here skips DisableReadOnly
+			// below, and a node promoted into promotion starts read_only=1 (replicas are
+			// kept in read-only by ConfigureReplica), so the switchover then commits a new
+			// primary that cannot accept writes. Log and fall through instead, and keep
+			// every other error fatal. The multi-cluster primary path delegates to this
+			// function, so this one change covers both topologies.
 			if sql.IsGtidSlavePosNoValueForDomain(err) {
-				return nil
+				r.logger.Info("gtid_slave_pos has no value for domain, skipping it during primary configuration")
+			} else {
+				return fmt.Errorf("error resetting slave position: %v", err)
 			}
-			return fmt.Errorf("error resetting slave position: %v", err)
 		}
 	}
 	if err := client.DisableReadOnly(ctx); err != nil {
