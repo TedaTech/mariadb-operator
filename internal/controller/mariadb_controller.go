@@ -1,3 +1,7 @@
+// Package controller reconciles MariaDB custom resources.
+// Baseline marker for the teda/26.6.0 CI integration-test run (PR teda/ci-baseline-26.6.0):
+// the base branch has never exercised CI, and this trivial change only exists to
+// bypass the detect-noop md-only skip so the basic integration suite executes.
 package controller
 
 import (
