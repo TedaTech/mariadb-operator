@@ -384,6 +384,22 @@ func (r *ReplicationReconciler) configureNewPrimary(ctx context.Context, req *Re
 	if err := topology.ConfigurePrimary(ctx, newPrimaryClient); err != nil {
 		return fmt.Errorf("error configuring new primary vars: %v", err)
 	}
+
+	// The promotion is committed to status right after this phase, and from then on the
+	// primary Service (built from status.currentPrimaryPodIndex) selects this pod. A
+	// primary that is still read_only at that point takes the whole cluster's writes
+	// down, and nothing re-asserts read_only=0 afterwards: role inference classifies it
+	// as primary and steady-state reconciliation skips it. Fail the phase instead so the
+	// promotion stays uncommitted and the routine retries.
+	readOnly, err := newPrimaryClient.GetReadOnly(ctx)
+	if err != nil {
+		return fmt.Errorf("error reading read_only in new primary: %v", err)
+	}
+	if readOnly {
+		r.recorder.Eventf(req.mariadb, nil, corev1.EventTypeWarning, mariadbv1alpha1.ReasonPrimaryStillReadOnly,
+			mariadbv1alpha1.ActionReconciling, "New primary at index '%d' is still read_only after configuration", newPrimary)
+		return fmt.Errorf("new primary at index '%d' is still read_only after configuration", newPrimary)
+	}
 	return nil
 }
 
