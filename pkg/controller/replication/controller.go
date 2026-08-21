@@ -478,5 +478,14 @@ func shouldSkipPrimaryReconciliation(mariadb *mariadbv1alpha1.MariaDB, replRoles
 	if mariadb.IsMultiClusterReplica() {
 		return role == mariadbv1alpha1.ReplicationRolePrimaryReplica
 	}
+	if !mariadb.HasConfiguredReplication() {
+		// The spec-primary pod reports role=Primary (via the currentPrimaryPodIndex
+		// inference) as soon as status is defaulted, before ConfigurePrimary has
+		// ever run. Skipping on role alone leaves a fresh cluster without a
+		// configured primary - no replication user, read_only never asserted - so
+		// replicas can never connect and never become ready. Configure the primary
+		// at least once before trusting the role-based fast path.
+		return false
+	}
 	return role == mariadbv1alpha1.ReplicationRolePrimary
 }
