@@ -255,7 +255,7 @@ func (r *ReplicationReconciler) ReconcileReplicationInPod(ctx context.Context, r
 
 	if primaryPodIndex == podIndex {
 		if shouldSkipPrimaryReconciliation(req.mariadb, replRoles, pod, logger) {
-			return ctrl.Result{}, nil
+			return ctrl.Result{}, r.assertPrimaryWritable(ctx, req, pod, logger)
 		}
 		client, err := req.replClientSet.currentPrimaryClient(ctx)
 		if err != nil {
@@ -266,7 +266,7 @@ func (r *ReplicationReconciler) ReconcileReplicationInPod(ctx context.Context, r
 		if err := topology.ConfigurePrimary(ctx, client); err != nil {
 			return ctrl.Result{}, fmt.Errorf("error configuring primary: %v", err)
 		}
-		return ctrl.Result{}, nil
+		return ctrl.Result{}, r.assertPrimaryWritable(ctx, req, pod, logger)
 	}
 
 	if !opts.forceReplicaConfiguration {
@@ -287,7 +287,13 @@ func (r *ReplicationReconciler) ReconcileReplicationInPod(ctx context.Context, r
 				// an ex-primary demoted before this status was written, both
 				// come back writable and stay that way indefinitely. A stray
 				// write there does not replicate and diverges the cluster
-				// permanently, so re-assert it every reconcile.
+				// permanently, so re-assert it every reconcile. A pod the spec
+				// designates as primary is only transiently classified as a
+				// replica (role status lags a promotion): forcing read_only on
+				// it would fight the promotion.
+				if podIsSpecPrimary(req, podIndex) {
+					return ctrl.Result{}, nil
+				}
 				return ctrl.Result{}, r.assertReplicaReadOnly(ctx, req, podIndex, pod, logger)
 			}
 		}
@@ -466,6 +472,52 @@ func (r *ReplicationReconciler) patchStatus(ctx context.Context, mariadb *mariad
 	patch := client.MergeFrom(mariadb.DeepCopy())
 	patcher(&mariadb.Status)
 	return r.Status().Patch(ctx, mariadb, patch)
+}
+
+// podIsSpecPrimary reports whether the spec designates this pod index as primary. Role
+// status is inferred independently and can lag a promotion, so a pod the spec promotes must
+// never be treated as a replica here — in particular, must never be forced read_only.
+func podIsSpecPrimary(req *ReconcileRequest, podIndex int) bool {
+	replication := ptr.Deref(req.mariadb.Spec.Replication, mariadbv1alpha1.Replication{})
+	return replication.Primary.PodIndex != nil && *replication.Primary.PodIndex == podIndex
+}
+
+// shouldReassertPrimaryWritable gates the read_only=OFF assertion on the current primary.
+// Explicitly requested read-only (maintenance mode) must survive, and an in-flight
+// switchover has its own handling of the primary's read_only.
+func shouldReassertPrimaryWritable(mdb *mariadbv1alpha1.MariaDB) bool {
+	return !mdb.IsReadOnlyEnabled() && !mdb.IsSwitchingPrimary() && !mdb.IsReplicationSwitchoverRequired()
+}
+
+// assertPrimaryWritable makes read_only=OFF true of the current primary. The mirror of
+// assertReplicaReadOnly: read_only is a runtime SET GLOBAL written only on role changes, so
+// a primary that restarts into read_only — or one that a failed switchover or the
+// maintenance reconciler left read-only — stays read-only forever: role inference
+// classifies the pod as primary and the steady-state ConfigurePrimary path is skipped.
+// Deliberately non-fatal, same as its mirror.
+func (r *ReplicationReconciler) assertPrimaryWritable(ctx context.Context, req *ReconcileRequest, pod string,
+	logger logr.Logger) error {
+	if !shouldReassertPrimaryWritable(req.mariadb) {
+		return nil
+	}
+	client, err := req.replClientSet.currentPrimaryClient(ctx)
+	if err != nil {
+		logger.V(1).Info("error getting primary client to assert read_only", "err", err, "pod", pod)
+		return nil
+	}
+	readOnly, err := client.GetReadOnly(ctx)
+	if err != nil {
+		logger.V(1).Info("error reading read_only from primary", "err", err, "pod", pod)
+		return nil
+	}
+	if !readOnly {
+		return nil
+	}
+	logger.Info("Primary is read_only, re-asserting writability", "pod", pod)
+	if err := client.DisableReadOnly(ctx); err != nil {
+		return fmt.Errorf("error disabling read_only in primary '%s': %v", pod, err)
+	}
+	return nil
 }
 
 func shouldSkipPrimaryReconciliation(mariadb *mariadbv1alpha1.MariaDB, replRoles map[string]mariadbv1alpha1.ReplicationRole,

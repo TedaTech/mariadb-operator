@@ -6,6 +6,7 @@ import (
 
 	mariadbv1alpha1 "github.com/mariadb-operator/mariadb-operator/v26/api/v1alpha1"
 	conditions "github.com/mariadb-operator/mariadb-operator/v26/pkg/condition"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 )
 
@@ -134,6 +135,125 @@ func TestGetReplicaOptsPreservesBinlogsUnderPITR(t *testing.T) {
 			}
 			if got := resetsMaster(opts); got != tt.wantResetMaster {
 				t.Errorf("ResetMaster = %v, want %v", got, tt.wantResetMaster)
+			}
+		})
+	}
+}
+
+// TestPodIsSpecPrimary pins the guard that keeps the replica path off a pod the spec
+// designates as primary. Role status is inferred independently and lags a promotion, so a
+// stale status must never cause the operator to force read_only on the node it is about to
+// promote.
+func TestPodIsSpecPrimary(t *testing.T) {
+	specPrimary := 2
+
+	cases := []struct {
+		name     string
+		mariadb  *mariadbv1alpha1.MariaDB
+		podIndex int
+		want     bool
+	}{
+		{
+			name: "matching spec primary index",
+			mariadb: &mariadbv1alpha1.MariaDB{
+				Spec: mariadbv1alpha1.MariaDBSpec{
+					Replication: &mariadbv1alpha1.Replication{
+						ReplicationSpec: mariadbv1alpha1.ReplicationSpec{
+							Primary: mariadbv1alpha1.PrimaryReplication{PodIndex: &specPrimary},
+						},
+					},
+				},
+			},
+			podIndex: specPrimary,
+			want:     true,
+		},
+		{
+			name: "different pod index",
+			mariadb: &mariadbv1alpha1.MariaDB{
+				Spec: mariadbv1alpha1.MariaDBSpec{
+					Replication: &mariadbv1alpha1.Replication{
+						ReplicationSpec: mariadbv1alpha1.ReplicationSpec{
+							Primary: mariadbv1alpha1.PrimaryReplication{PodIndex: &specPrimary},
+						},
+					},
+				},
+			},
+			podIndex: 0,
+			want:     false,
+		},
+		{
+			name:     "no replication configured",
+			mariadb:  &mariadbv1alpha1.MariaDB{},
+			podIndex: 0,
+			want:     false,
+		},
+	}
+
+	for _, tt := range cases {
+		t.Run(tt.name, func(t *testing.T) {
+			req := &ReconcileRequest{mariadb: tt.mariadb}
+			if got := podIsSpecPrimary(req, tt.podIndex); got != tt.want {
+				t.Errorf("podIsSpecPrimary() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+// TestShouldReassertPrimaryWritable pins when the primary read_only=OFF assertion is safe to
+// run: never against an explicitly read-only cluster, and never while a switchover is in
+// flight (that path manages the primary's read_only itself).
+func TestShouldReassertPrimaryWritable(t *testing.T) {
+	caseMdb := func(build func(m *mariadbv1alpha1.MariaDB)) *mariadbv1alpha1.MariaDB {
+		m := &mariadbv1alpha1.MariaDB{
+			Spec: mariadbv1alpha1.MariaDBSpec{
+				Replication: &mariadbv1alpha1.Replication{Enabled: true},
+			},
+		}
+		build(m)
+		return m
+	}
+	statusIndex := 0
+	specIndex := 1
+
+	cases := []struct {
+		name    string
+		mariadb *mariadbv1alpha1.MariaDB
+		want    bool
+	}{
+		{
+			name:    "steady state",
+			mariadb: caseMdb(func(m *mariadbv1alpha1.MariaDB) {}),
+			want:    true,
+		},
+		{
+			name: "maintenance read-only must survive",
+			mariadb: caseMdb(func(m *mariadbv1alpha1.MariaDB) {
+				m.Spec.Maintenance = &mariadbv1alpha1.MariaDBMaintenance{Enabled: true, ReadOnly: true}
+			}),
+			want: false,
+		},
+		{
+			name: "switchover in flight",
+			mariadb: caseMdb(func(m *mariadbv1alpha1.MariaDB) {
+				m.Status = mariadbv1alpha1.MariaDBStatus{
+					CurrentPrimaryPodIndex: &statusIndex,
+					Conditions: []metav1.Condition{
+						{
+							Type:   mariadbv1alpha1.ConditionTypePrimarySwitched,
+							Status: metav1.ConditionFalse,
+						},
+					},
+				}
+				m.Spec.Replication.Primary = mariadbv1alpha1.PrimaryReplication{PodIndex: &specIndex}
+			}),
+			want: false,
+		},
+	}
+
+	for _, tt := range cases {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := shouldReassertPrimaryWritable(tt.mariadb); got != tt.want {
+				t.Errorf("shouldReassertPrimaryWritable() = %v, want %v", got, tt.want)
 			}
 		})
 	}
