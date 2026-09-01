@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"time"
 
 	mariadbv1alpha1 "github.com/mariadb-operator/mariadb-operator/v26/api/v1alpha1"
 	"github.com/mariadb-operator/mariadb-operator/v26/pkg/refresolver"
@@ -28,7 +29,12 @@ func (c *ReplicationClientSet) close() error {
 	return c.Close()
 }
 
+const defaultReplicationClientTimeout = 3 * time.Second
+
 func (c *ReplicationClientSet) clientForIndex(ctx context.Context, index int, clientOpts ...sqlClient.Opt) (*sqlClient.Client, error) {
+	ctx, cancel := context.WithTimeout(ctx, defaultReplicationClientTimeout)
+	defer cancel()
+	clientOpts = append([]sqlClient.Opt{sqlClient.WithTimeout(defaultReplicationClientTimeout)}, clientOpts...)
 	return c.ClientForIndex(ctx, index, clientOpts...)
 }
 
@@ -36,7 +42,7 @@ func (c *ReplicationClientSet) currentPrimaryClient(ctx context.Context, clientO
 	if c.Mariadb.Status.CurrentPrimaryPodIndex == nil {
 		return nil, errors.New("'status.currentPrimaryPodIndex' must be set")
 	}
-	client, err := c.ClientForIndex(ctx, *c.Mariadb.Status.CurrentPrimaryPodIndex, clientOpts...)
+	client, err := c.clientForIndex(ctx, *c.Mariadb.Status.CurrentPrimaryPodIndex, clientOpts...)
 	if err != nil {
 		return nil, fmt.Errorf("error getting current primary client: %v", err)
 	}
@@ -45,7 +51,7 @@ func (c *ReplicationClientSet) currentPrimaryClient(ctx context.Context, clientO
 
 func (c *ReplicationClientSet) newPrimaryClient(ctx context.Context, clientOpts ...sqlClient.Opt) (*sqlClient.Client, error) {
 	replication := ptr.Deref(c.Mariadb.Spec.Replication, mariadbv1alpha1.Replication{})
-	client, err := c.ClientForIndex(ctx, *replication.Primary.PodIndex, clientOpts...)
+	client, err := c.clientForIndex(ctx, *replication.Primary.PodIndex, clientOpts...)
 	if err != nil {
 		return nil, fmt.Errorf("error getting new primary client: %v", err)
 	}

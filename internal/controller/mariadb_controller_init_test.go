@@ -46,7 +46,7 @@ func TestPbInitRetryCount(t *testing.T) {
 			want: 4,
 		},
 		{
-			name: "unparseable value counts as zero",
+			name: "unparsable value counts as zero",
 			mdb: &mariadbv1alpha1.MariaDB{
 				ObjectMeta: metav1.ObjectMeta{
 					Annotations: map[string]string{

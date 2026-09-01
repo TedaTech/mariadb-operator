@@ -1,7 +1,11 @@
 package sql
 
 import (
+	"context"
+	"fmt"
+	"net"
 	"testing"
+	"time"
 
 	"github.com/google/go-cmp/cmp"
 	mariadbv1alpha1 "github.com/mariadb-operator/mariadb-operator/v26/api/v1alpha1"
@@ -231,5 +235,42 @@ func TestRequireQuery(t *testing.T) {
 				t.Errorf("unexpected bundle content (-want +got):\n%s", diff)
 			}
 		})
+	}
+}
+
+func TestConnectContextTimeout(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("error listening: %v", err)
+	}
+	defer ln.Close()
+
+	// Accept connections and hold them open without responding, mimicking a
+	// wedged server whose TCP handshake succeeds but which never replies.
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			defer conn.Close()
+		}
+	}()
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+
+	dsn := fmt.Sprintf("root@tcp(%s)/", ln.Addr().String())
+	start := time.Now()
+	db, err := ConnectContext(ctx, dsn)
+	elapsed := time.Since(start)
+	if err == nil {
+		if db != nil {
+			db.Close()
+		}
+		t.Fatalf("expected error connecting to unresponsive server, got nil")
+	}
+	if elapsed > 3*time.Second {
+		t.Fatalf("ConnectContext took %v, expected to be bounded by the context deadline", elapsed)
 	}
 }
