@@ -1,14 +1,21 @@
 package compression
 
 import (
+	"bytes"
 	"context"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 
 	"github.com/go-logr/logr"
 	"github.com/hashicorp/go-multierror"
 	mariadbv1alpha1 "github.com/mariadb-operator/mariadb-operator/v26/api/v1alpha1"
+)
+
+var (
+	gzipMagicBytes  = []byte{0x1f, 0x8b}
+	bzip2MagicBytes = []byte{'B', 'Z', 'h'}
 )
 
 type BackupCompressor interface {
@@ -100,10 +107,45 @@ func (c *Bzip2BackupCompressor) Decompress(fileName string) (string, error) {
 	return decompressFile(c.basePath, fileName, c.logger, c.getUncompressedFilename, c.compressor)
 }
 
+// isAlreadyCompressed reports whether filePath already holds a gzip or bzip2
+// stream. compressFile replaces the plain file in place, so when the backup
+// command is retried (RestartPolicy: OnFailure restarts the container, which
+// re-runs Compress over the same file) it re-encounters the stream it produced
+// on the previous attempt. Compressing that would ship gzip(gzip(xbstream)) to
+// object storage; restore unwraps a single layer, so mariadb-backup would fail
+// with 'wrong chunk magic at offset 0x0'. A plain mariadb-backup stream starts
+// with its own header, never either magic, so a genuine plain file is never
+// skipped.
+func isAlreadyCompressed(filePath string) (bool, error) {
+	file, err := os.Open(filePath)
+	if err != nil {
+		return false, err
+	}
+	defer file.Close()
+
+	head := make([]byte, 3)
+	n, err := io.ReadFull(file, head)
+	if err != nil && err != io.EOF && err != io.ErrUnexpectedEOF {
+		return false, err
+	}
+	head = head[:n]
+	return bytes.HasPrefix(head, gzipMagicBytes) || bytes.HasPrefix(head, bzip2MagicBytes), nil
+}
+
 func compressFile(path, fileName string, logger logr.Logger, compressor Compressor) error {
 	filePath := getFilePath(path, fileName)
-	compressedFilePath := filePath + ".tmp"
 	logger.Info("compressing file", "file", filePath)
+
+	alreadyCompressed, err := isAlreadyCompressed(filePath)
+	if err != nil {
+		return err
+	}
+	if alreadyCompressed {
+		logger.V(1).Info("file already compressed, skipping", "file", filePath)
+		return nil
+	}
+
+	compressedFilePath := filePath + ".tmp"
 
 	// compressedFilePath must be closed before renaming. See: https://github.com/mariadb-operator/mariadb-operator/issues/1007
 	if err := func() error {

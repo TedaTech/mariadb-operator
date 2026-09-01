@@ -384,6 +384,29 @@ func (r *ReplicationReconciler) configureNewPrimary(ctx context.Context, req *Re
 	if err := topology.ConfigurePrimary(ctx, newPrimaryClient); err != nil {
 		return fmt.Errorf("error configuring new primary vars: %v", err)
 	}
+
+	// The promotion commits to status right after this phase, and steady-state
+	// reconciliation skips a switching primary, so the commit point must prove the
+	// new primary is writable.
+	readOnly, err := newPrimaryClient.GetReadOnly(ctx)
+	if err != nil {
+		return fmt.Errorf("error reading read_only in new primary: %v", err)
+	}
+	if readOnly {
+		// One idempotent repair attempt, then verify: fail only if it persists.
+		if err := newPrimaryClient.DisableReadOnly(ctx); err != nil {
+			return fmt.Errorf("error disabling read_only in new primary: %v", err)
+		}
+		readOnly, err = newPrimaryClient.GetReadOnly(ctx)
+		if err != nil {
+			return fmt.Errorf("error reading read_only in new primary: %v", err)
+		}
+		if readOnly {
+			r.recorder.Eventf(req.mariadb, nil, corev1.EventTypeWarning, mariadbv1alpha1.ReasonPrimaryStillReadOnly,
+				mariadbv1alpha1.ActionReconciling, "New primary at index '%d' is still read_only after configuration", newPrimary)
+			return fmt.Errorf("new primary at index '%d' is still read_only after configuration", newPrimary)
+		}
+	}
 	return nil
 }
 
@@ -559,7 +582,7 @@ func (r *ReplicationReconciler) configureReplicaOpts(ctx context.Context, req *R
 }
 
 func (r *ReplicationReconciler) currentPrimaryReady(ctx context.Context, mariadb *mariadbv1alpha1.MariaDB,
-	clientSet *ReplicationClientSet) (bool, error) {
+	clientSet replicationClientSet) (bool, error) {
 	if mariadb.Status.CurrentPrimaryPodIndex == nil {
 		return false, errors.New("'status.currentPrimaryPodIndex' must be set")
 	}

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strconv"
 	"time"
 
 	"github.com/go-logr/logr"
@@ -13,6 +14,7 @@ import (
 	condition "github.com/mariadb-operator/mariadb-operator/v26/pkg/condition"
 	"github.com/mariadb-operator/mariadb-operator/v26/pkg/controller/replication"
 	jobpkg "github.com/mariadb-operator/mariadb-operator/v26/pkg/job"
+	"github.com/mariadb-operator/mariadb-operator/v26/pkg/metadata"
 	podpkg "github.com/mariadb-operator/mariadb-operator/v26/pkg/pod"
 	"github.com/mariadb-operator/mariadb-operator/v26/pkg/pvc"
 	stsobj "github.com/mariadb-operator/mariadb-operator/v26/pkg/statefulset"
@@ -319,6 +321,12 @@ func (r *MariaDBReconciler) reconcileRollingInitJobs(ctx context.Context, mariad
 	})
 }
 
+// maxFailedInitJobRetries bounds how many times a failed PhysicalBackup init job is
+// deleted and re-created before the reconcile gives up. Above the cap the job is left in
+// place as evidence and the failure surfaces as an event, because re-firing a job that
+// fails for a deterministic reason (e.g. a corrupt backup object) would only churn.
+const maxFailedInitJobRetries = 5
+
 func (r *MariaDBReconciler) reconcileAndWaitForInitJob(ctx context.Context, mariadb *mariadbv1alpha1.MariaDB,
 	key types.NamespacedName, podIndex int, logger logr.Logger, restoreOpts ...builder.RestoreOpt) (ctrl.Result, error) {
 	var job batchv1.Job
@@ -330,12 +338,84 @@ func (r *MariaDBReconciler) reconcileAndWaitForInitJob(ctx context.Context, mari
 			}
 			return ctrl.Result{RequeueAfter: 1 * time.Second}, nil
 		}
+		return ctrl.Result{}, fmt.Errorf("error getting PhysicalBackup init job: %v", err)
 	}
-	if !jobpkg.IsJobComplete(&job) {
-		logger.V(1).Info("PhysicalBackup init job not completed. Requeuing...")
-		return ctrl.Result{RequeueAfter: 1 * time.Second}, nil
+
+	if jobpkg.IsJobComplete(&job) {
+		return ctrl.Result{}, nil
 	}
-	return ctrl.Result{}, nil
+
+	// A failed job is not 'not yet complete': it will never complete on its own, and
+	// waiting on it blocks the pod's init container forever — replicaToRecover is only
+	// cleared after the job completes, so the replica stays stuck polled by the init
+	// container while the cluster reports Ready=False. Re-fire it, bounded.
+	if jobpkg.IsJobFailed(&job) {
+		return r.reconcileFailedInitJob(ctx, mariadb, key, podIndex, logger)
+	}
+
+	logger.V(1).Info("PhysicalBackup init job not completed. Requeuing...")
+	return ctrl.Result{RequeueAfter: 1 * time.Second}, nil
+}
+
+func (r *MariaDBReconciler) reconcileFailedInitJob(ctx context.Context, mariadb *mariadbv1alpha1.MariaDB,
+	key types.NamespacedName, podIndex int, logger logr.Logger) (ctrl.Result, error) {
+	pod := stsobj.PodName(mariadb.ObjectMeta, podIndex)
+	retries := pbInitRetryCount(mariadb, pod)
+
+	if retries >= maxFailedInitJobRetries {
+		logger.Error(nil, "PhysicalBackup init job failed and max retries reached",
+			"job", key.Name, "pod", pod, "retries", retries)
+		r.Recorder.Eventf(mariadb, nil, corev1.EventTypeWarning, mariadbv1alpha1.ReasonInitJobFailed,
+			mariadbv1alpha1.ActionReconciling, "Init job '%s' failed after %d retries. Manual intervention required.", key.Name, retries)
+		return ctrl.Result{RequeueAfter: 5 * time.Minute}, nil
+	}
+
+	logger.Info("PhysicalBackup init job failed, deleting to re-fire",
+		"job", key.Name, "pod", pod, "retry", retries+1)
+	var job batchv1.Job
+	if err := r.Get(ctx, key, &job); err != nil {
+		return ctrl.Result{}, fmt.Errorf("error getting failed PhysicalBackup init job: %v", err)
+	}
+	if err := r.Delete(ctx, &job, &client.DeleteOptions{PropagationPolicy: ptr.To(metav1.DeletePropagationForeground)}); err != nil {
+		if !apierrors.IsNotFound(err) {
+			return ctrl.Result{}, fmt.Errorf("error deleting failed PhysicalBackup init job: %v", err)
+		}
+	}
+	if err := r.patchInitJobRetry(ctx, mariadb, pod, retries+1); err != nil {
+		return ctrl.Result{}, err
+	}
+	r.Recorder.Eventf(mariadb, nil, corev1.EventTypeNormal, mariadbv1alpha1.ReasonInitJobRetried,
+		mariadbv1alpha1.ActionReconciling, "Re-firing init job '%s' after previous attempt failed", key.Name)
+
+	return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
+}
+
+func pbInitRetryAnnotationKey(pod string) string {
+	return metadata.PbInitRetryAnnotationPrefix + pod
+}
+
+func pbInitRetryCount(mariadb *mariadbv1alpha1.MariaDB, pod string) int {
+	if mariadb.Annotations == nil {
+		return 0
+	}
+	v, ok := mariadb.Annotations[pbInitRetryAnnotationKey(pod)]
+	if !ok {
+		return 0
+	}
+	retries, err := strconv.Atoi(v)
+	if err != nil {
+		return 0
+	}
+	return retries
+}
+
+func (r *MariaDBReconciler) patchInitJobRetry(ctx context.Context, mariadb *mariadbv1alpha1.MariaDB, pod string, retries int) error {
+	patch := client.MergeFrom(mariadb.DeepCopy())
+	if mariadb.Annotations == nil {
+		mariadb.Annotations = make(map[string]string)
+	}
+	mariadb.Annotations[pbInitRetryAnnotationKey(pod)] = strconv.Itoa(retries)
+	return r.Patch(ctx, mariadb, patch)
 }
 
 func (r *MariaDBReconciler) createInitJob(ctx context.Context, mariadb *mariadbv1alpha1.MariaDB,

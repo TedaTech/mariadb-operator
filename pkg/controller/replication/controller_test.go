@@ -2,8 +2,10 @@ package replication
 
 import (
 	"context"
+	"errors"
 	"testing"
 
+	"github.com/DATA-DOG/go-sqlmock"
 	mariadbv1alpha1 "github.com/mariadb-operator/mariadb-operator/v26/api/v1alpha1"
 	conditions "github.com/mariadb-operator/mariadb-operator/v26/pkg/condition"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
@@ -134,6 +136,119 @@ func TestGetReplicaOptsPreservesBinlogsUnderPITR(t *testing.T) {
 			}
 			if got := resetsMaster(opts); got != tt.wantResetMaster {
 				t.Errorf("ResetMaster = %v, want %v", got, tt.wantResetMaster)
+			}
+		})
+	}
+}
+
+// TestPodIsSpecPrimary pins the guard that keeps the replica path off a pod the spec
+// designates as primary. Role status is inferred independently and lags a promotion, so a
+// stale status must never cause the operator to force read_only on the node it is about to
+// promote.
+func TestPodIsSpecPrimary(t *testing.T) {
+	specPrimary := 2
+
+	cases := []struct {
+		name     string
+		mariadb  *mariadbv1alpha1.MariaDB
+		podIndex int
+		want     bool
+	}{
+		{
+			name: "matching spec primary index",
+			mariadb: &mariadbv1alpha1.MariaDB{
+				Spec: mariadbv1alpha1.MariaDBSpec{
+					Replication: &mariadbv1alpha1.Replication{
+						ReplicationSpec: mariadbv1alpha1.ReplicationSpec{
+							Primary: mariadbv1alpha1.PrimaryReplication{PodIndex: &specPrimary},
+						},
+					},
+				},
+			},
+			podIndex: specPrimary,
+			want:     true,
+		},
+		{
+			name: "different pod index",
+			mariadb: &mariadbv1alpha1.MariaDB{
+				Spec: mariadbv1alpha1.MariaDBSpec{
+					Replication: &mariadbv1alpha1.Replication{
+						ReplicationSpec: mariadbv1alpha1.ReplicationSpec{
+							Primary: mariadbv1alpha1.PrimaryReplication{PodIndex: &specPrimary},
+						},
+					},
+				},
+			},
+			podIndex: 0,
+			want:     false,
+		},
+		{
+			name:     "no replication configured",
+			mariadb:  &mariadbv1alpha1.MariaDB{},
+			podIndex: 0,
+			want:     false,
+		},
+	}
+
+	for _, tt := range cases {
+		t.Run(tt.name, func(t *testing.T) {
+			req := &ReconcileRequest{mariadb: tt.mariadb}
+			if got := podIsSpecPrimary(req, tt.podIndex); got != tt.want {
+				t.Errorf("podIsSpecPrimary() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+// TestAssertPrimaryWritable covers the read-then-fix invariant asserted on the primary
+// right after ConfigurePrimary: read_only=1 is cleared with one SET, a writable primary
+// is left untouched, and a read error is deliberately non-fatal.
+func TestAssertPrimaryWritable(t *testing.T) {
+	cases := []struct {
+		name    string
+		script  func(mock sqlmock.Sqlmock)
+		wantErr bool
+	}{
+		{
+			name: "read_only primary is cleared",
+			script: func(mock sqlmock.Sqlmock) {
+				mock.ExpectQuery("SELECT @@global.read_only").
+					WillReturnRows(sqlmock.NewRows([]string{"read_only"}).AddRow("1"))
+				mock.ExpectExec("SET @@global.read_only=0").WillReturnResult(sqlmock.NewResult(0, 0))
+			},
+		},
+		{
+			name: "writable primary is left untouched",
+			script: func(mock sqlmock.Sqlmock) {
+				mock.ExpectQuery("SELECT @@global.read_only").
+					WillReturnRows(sqlmock.NewRows([]string{"read_only"}).AddRow("0"))
+			},
+		},
+		{
+			name: "read error is non-fatal",
+			script: func(mock sqlmock.Sqlmock) {
+				mock.ExpectQuery("SELECT @@global.read_only").WillReturnError(errors.New("boom"))
+			},
+		},
+	}
+
+	for _, tt := range cases {
+		t.Run(tt.name, func(t *testing.T) {
+			client, mock := newMockedSQLClient(t)
+			tt.script(mock)
+
+			r := &ReplicationReconciler{}
+			req := &ReconcileRequest{
+				mariadb:       freshMariadbWithReplication(),
+				replClientSet: &fakeReplicationClientSet{client: client},
+			}
+
+			err := r.assertPrimaryWritable(context.Background(), req, "mariadb-0", logf.Log)
+			if tt.wantErr && err == nil {
+				t.Fatal("assertPrimaryWritable() error = nil, want an error")
+			}
+			if !tt.wantErr && err != nil {
+				t.Fatalf("assertPrimaryWritable() error = %v, want nil", err)
 			}
 		})
 	}
