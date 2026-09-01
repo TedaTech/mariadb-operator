@@ -59,6 +59,12 @@ type Topology interface {
 	ConfigureReplica(ctx context.Context, client *sql.Client, primaryPodIndex int, replicaOpts ...ConfigureReplicaOpt) error
 }
 
+// topologyManager is the subset of TopologyManager the reconcile paths need. It
+// exists so tests can inject a fake; *TopologyManager satisfies it.
+type topologyManager interface {
+	TopologyForMariaDB(mariadb *mariadbv1alpha1.MariaDB, logger logr.Logger) Topology
+}
+
 type TopologyManager struct {
 	client.Client
 	refResolver *refresolver.RefResolver

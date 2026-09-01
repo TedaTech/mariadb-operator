@@ -31,6 +31,16 @@ func (c *ReplicationClientSet) close() error {
 
 const defaultReplicationClientTimeout = 3 * time.Second
 
+// replicationClientSet is the subset of ReplicationClientSet the reconcile paths
+// need. It exists so tests can inject a fake client set; *ReplicationClientSet
+// satisfies it.
+type replicationClientSet interface {
+	close() error
+	currentPrimaryClient(ctx context.Context, clientOpts ...sqlClient.Opt) (*sqlClient.Client, error)
+	clientForIndex(ctx context.Context, index int, clientOpts ...sqlClient.Opt) (*sqlClient.Client, error)
+	newPrimaryClient(ctx context.Context, clientOpts ...sqlClient.Opt) (*sqlClient.Client, error)
+}
+
 func (c *ReplicationClientSet) clientForIndex(ctx context.Context, index int, clientOpts ...sqlClient.Opt) (*sqlClient.Client, error) {
 	ctx, cancel := context.WithTimeout(ctx, defaultReplicationClientTimeout)
 	defer cancel()

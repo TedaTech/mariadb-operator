@@ -1,10 +1,16 @@
 package replication
 
 import (
+	"context"
+	"strings"
 	"testing"
 
+	"github.com/DATA-DOG/go-sqlmock"
+	"github.com/go-logr/logr"
 	mariadbv1alpha1 "github.com/mariadb-operator/mariadb-operator/v26/api/v1alpha1"
 	"github.com/mariadb-operator/mariadb-operator/v26/pkg/sql"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/tools/events"
 	"k8s.io/utils/ptr"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 )
@@ -142,5 +148,172 @@ func TestCommitsPromotionMarksExactlyThePromotionPhase(t *testing.T) {
 	// Anything that makes the promotion itself true must run before it.
 	if committing[0] == len(phases)-1 {
 		t.Error("the committing phase is last; the commit is then indistinguishable from the old end-of-loop patch")
+	}
+}
+
+type fakeReplicationClientSet struct {
+	client *sql.Client
+}
+
+func (f *fakeReplicationClientSet) close() error { return nil }
+
+func (f *fakeReplicationClientSet) currentPrimaryClient(ctx context.Context,
+	clientOpts ...sql.Opt) (*sql.Client, error) {
+	return f.client, nil
+}
+
+func (f *fakeReplicationClientSet) clientForIndex(ctx context.Context, index int,
+	clientOpts ...sql.Opt) (*sql.Client, error) {
+	return f.client, nil
+}
+
+func (f *fakeReplicationClientSet) newPrimaryClient(ctx context.Context,
+	clientOpts ...sql.Opt) (*sql.Client, error) {
+	return f.client, nil
+}
+
+type fakeTopologyManager struct {
+	topology Topology
+}
+
+func (f *fakeTopologyManager) TopologyForMariaDB(mariadb *mariadbv1alpha1.MariaDB,
+	logger logr.Logger) Topology {
+	return f.topology
+}
+
+type noopTopology struct{}
+
+func (t *noopTopology) ConfigurePrimary(ctx context.Context, client *sql.Client) error {
+	return nil
+}
+
+func (t *noopTopology) ConfigureReplica(ctx context.Context, client *sql.Client,
+	primaryPodIndex int, replicaOpts ...ConfigureReplicaOpt) error {
+	return nil
+}
+
+func newMockedSQLClient(t *testing.T) (*sql.Client, sqlmock.Sqlmock) {
+	t.Helper()
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("error creating sqlmock: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := mock.ExpectationsWereMet(); err != nil {
+			t.Errorf("sqlmock expectations not met: %v", err)
+		}
+		db.Close()
+	})
+	return sql.NewClientWithDB(db), mock
+}
+
+// TestConfigureNewPrimaryEnsuresWritable covers the promotion gate in
+// configureNewPrimary: the promotion is committed right after this phase and nothing
+// re-asserts read_only=0 for a switching primary, so the phase re-asserts it once and
+// fails — leaving the promotion uncommitted — only if the variable persists.
+func TestConfigureNewPrimaryEnsuresWritable(t *testing.T) {
+	cases := []struct {
+		name        string
+		readOnly    string
+		repair      bool
+		afterRepair string
+		wantErr     bool
+	}{
+		{
+			name:     "writable new primary succeeds",
+			readOnly: "0",
+			wantErr:  false,
+		},
+		{
+			name:        "read_only re-asserted and passes",
+			readOnly:    "1",
+			repair:      true,
+			afterRepair: "0",
+			wantErr:     false,
+		},
+		{
+			name:        "read_only persists after re-assert fails the phase",
+			readOnly:    "1",
+			repair:      true,
+			afterRepair: "1",
+			wantErr:     true,
+		},
+	}
+
+	for _, tt := range cases {
+		t.Run(tt.name, func(t *testing.T) {
+			client, mock := newMockedSQLClient(t)
+			mock.ExpectQuery("SELECT @@global.read_only").
+				WillReturnRows(sqlmock.NewRows([]string{"read_only"}).AddRow(tt.readOnly))
+			if tt.repair {
+				mock.ExpectExec("SET @@global.read_only=0").WillReturnResult(sqlmock.NewResult(0, 0))
+				mock.ExpectQuery("SELECT @@global.read_only").
+					WillReturnRows(sqlmock.NewRows([]string{"read_only"}).AddRow(tt.afterRepair))
+			}
+
+			recorder := events.NewFakeRecorder(10)
+			r := &ReplicationReconciler{
+				recorder:        recorder,
+				topologyManager: &fakeTopologyManager{topology: &noopTopology{}},
+			}
+			req := &ReconcileRequest{
+				mariadb:       mariadbWithPrimaryPodIndex(1),
+				replClientSet: &fakeReplicationClientSet{client: client},
+			}
+
+			err := r.configureNewPrimary(context.Background(), req, logf.Log)
+			if tt.wantErr && err == nil {
+				t.Fatal("configureNewPrimary() error = nil, want the promotion to fail on a read_only new primary")
+			}
+			if tt.wantErr && !strings.Contains(err.Error(), "still read_only") {
+				t.Errorf("configureNewPrimary() error = %v, want it to mention the read_only new primary", err)
+			}
+			if !tt.wantErr && err != nil {
+				t.Fatalf("configureNewPrimary() error = %v, want nil", err)
+			}
+
+			events := drainEvents(recorder)
+			if got := containsEvent(events, string(mariadbv1alpha1.ReasonPrimaryStillReadOnly)); got != tt.wantErr {
+				t.Errorf("PrimaryStillReadOnly event present = %v, want %v (events: %v)", got, tt.wantErr, events)
+			}
+		})
+	}
+}
+
+func drainEvents(recorder *events.FakeRecorder) []string {
+	var drained []string
+	for {
+		select {
+		case e := <-recorder.Events:
+			drained = append(drained, e)
+		default:
+			return drained
+		}
+	}
+}
+
+func containsEvent(events []string, reason string) bool {
+	for _, e := range events {
+		if strings.Contains(e, reason) {
+			return true
+		}
+	}
+	return false
+}
+
+func mariadbWithPrimaryPodIndex(podIndex int) *mariadbv1alpha1.MariaDB {
+	return &mariadbv1alpha1.MariaDB{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "mariadb",
+			Namespace: "default",
+		},
+		Spec: mariadbv1alpha1.MariaDBSpec{
+			Replication: &mariadbv1alpha1.Replication{
+				Enabled: true,
+				ReplicationSpec: mariadbv1alpha1.ReplicationSpec{
+					Primary: mariadbv1alpha1.PrimaryReplication{PodIndex: ptr.To(podIndex)},
+				},
+			},
+		},
 	}
 }

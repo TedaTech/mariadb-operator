@@ -135,6 +135,12 @@ func NewClient(clientOpts ...Opt) (*Client, error) {
 	return newClient(context.Background(), clientOpts...)
 }
 
+// NewClientWithDB wraps an existing database handle. It exists so tests can
+// inject a sqlmock-backed handle; production code goes through NewClient.
+func NewClientWithDB(db *sql.DB) *Client {
+	return &Client{db: db}
+}
+
 func newClient(ctx context.Context, clientOpts ...Opt) (*Client, error) {
 	opts := Opts{}
 	for _, setOpt := range clientOpts {

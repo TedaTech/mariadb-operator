@@ -54,7 +54,7 @@ type ReplicationReconciler struct {
 	recorder            events.EventRecorder
 	builder             *builder.Builder
 	env                 *environment.OperatorEnv
-	topologyManager     *TopologyManager
+	topologyManager     topologyManager
 	refResolver         *refresolver.RefResolver
 	secretReconciler    *secret.SecretReconciler
 	configMapreconciler *configmap.ConfigMapReconciler
@@ -95,7 +95,7 @@ func NewReplicationReconciler(client client.Client, recorder events.EventRecorde
 type ReconcileRequest struct {
 	mariadb             *mariadbv1alpha1.MariaDB
 	key                 types.NamespacedName
-	replClientSet       *ReplicationClientSet
+	replClientSet       replicationClientSet
 	agentClientSet      *agentclient.ClientSet
 	currentPrimaryReady bool
 	replicasSynced      bool
