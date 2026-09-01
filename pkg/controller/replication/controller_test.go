@@ -2,11 +2,12 @@ package replication
 
 import (
 	"context"
+	"errors"
 	"testing"
 
+	"github.com/DATA-DOG/go-sqlmock"
 	mariadbv1alpha1 "github.com/mariadb-operator/mariadb-operator/v26/api/v1alpha1"
 	conditions "github.com/mariadb-operator/mariadb-operator/v26/pkg/condition"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 )
 
@@ -199,61 +200,55 @@ func TestPodIsSpecPrimary(t *testing.T) {
 	}
 }
 
-// TestShouldReassertPrimaryWritable pins when the primary read_only=OFF assertion is safe to
-// run: never against an explicitly read-only cluster, and never while a switchover is in
-// flight (that path manages the primary's read_only itself).
-func TestShouldReassertPrimaryWritable(t *testing.T) {
-	caseMdb := func(build func(m *mariadbv1alpha1.MariaDB)) *mariadbv1alpha1.MariaDB {
-		m := &mariadbv1alpha1.MariaDB{
-			Spec: mariadbv1alpha1.MariaDBSpec{
-				Replication: &mariadbv1alpha1.Replication{Enabled: true},
-			},
-		}
-		build(m)
-		return m
-	}
-	statusIndex := 0
-	specIndex := 1
-
+// TestAssertPrimaryWritable covers the read-then-fix invariant asserted on the primary
+// right after ConfigurePrimary: read_only=1 is cleared with one SET, a writable primary
+// is left untouched, and a read error is deliberately non-fatal.
+func TestAssertPrimaryWritable(t *testing.T) {
 	cases := []struct {
 		name    string
-		mariadb *mariadbv1alpha1.MariaDB
-		want    bool
+		script  func(mock sqlmock.Sqlmock)
+		wantErr bool
 	}{
 		{
-			name:    "steady state",
-			mariadb: caseMdb(func(m *mariadbv1alpha1.MariaDB) {}),
-			want:    true,
+			name: "read_only primary is cleared",
+			script: func(mock sqlmock.Sqlmock) {
+				mock.ExpectQuery("SELECT @@global.read_only").
+					WillReturnRows(sqlmock.NewRows([]string{"read_only"}).AddRow("1"))
+				mock.ExpectExec("SET @@global.read_only=0").WillReturnResult(sqlmock.NewResult(0, 0))
+			},
 		},
 		{
-			name: "maintenance read-only must survive",
-			mariadb: caseMdb(func(m *mariadbv1alpha1.MariaDB) {
-				m.Spec.Maintenance = &mariadbv1alpha1.MariaDBMaintenance{Enabled: true, ReadOnly: true}
-			}),
-			want: false,
+			name: "writable primary is left untouched",
+			script: func(mock sqlmock.Sqlmock) {
+				mock.ExpectQuery("SELECT @@global.read_only").
+					WillReturnRows(sqlmock.NewRows([]string{"read_only"}).AddRow("0"))
+			},
 		},
 		{
-			name: "switchover in flight",
-			mariadb: caseMdb(func(m *mariadbv1alpha1.MariaDB) {
-				m.Status = mariadbv1alpha1.MariaDBStatus{
-					CurrentPrimaryPodIndex: &statusIndex,
-					Conditions: []metav1.Condition{
-						{
-							Type:   mariadbv1alpha1.ConditionTypePrimarySwitched,
-							Status: metav1.ConditionFalse,
-						},
-					},
-				}
-				m.Spec.Replication.Primary = mariadbv1alpha1.PrimaryReplication{PodIndex: &specIndex}
-			}),
-			want: false,
+			name: "read error is non-fatal",
+			script: func(mock sqlmock.Sqlmock) {
+				mock.ExpectQuery("SELECT @@global.read_only").WillReturnError(errors.New("boom"))
+			},
 		},
 	}
 
 	for _, tt := range cases {
 		t.Run(tt.name, func(t *testing.T) {
-			if got := shouldReassertPrimaryWritable(tt.mariadb); got != tt.want {
-				t.Errorf("shouldReassertPrimaryWritable() = %v, want %v", got, tt.want)
+			client, mock := newMockedSQLClient(t)
+			tt.script(mock)
+
+			r := &ReplicationReconciler{}
+			req := &ReconcileRequest{
+				mariadb:       freshMariadbWithReplication(),
+				replClientSet: &fakeReplicationClientSet{client: client},
+			}
+
+			err := r.assertPrimaryWritable(context.Background(), req, "mariadb-0", logf.Log)
+			if tt.wantErr && err == nil {
+				t.Fatal("assertPrimaryWritable() error = nil, want an error")
+			}
+			if !tt.wantErr && err != nil {
+				t.Fatalf("assertPrimaryWritable() error = %v, want nil", err)
 			}
 		})
 	}

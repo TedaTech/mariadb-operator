@@ -255,7 +255,7 @@ func (r *ReplicationReconciler) ReconcileReplicationInPod(ctx context.Context, r
 
 	if primaryPodIndex == podIndex {
 		if shouldSkipPrimaryReconciliation(req.mariadb, replRoles, pod, logger) {
-			return ctrl.Result{}, r.assertPrimaryWritable(ctx, req, pod, logger)
+			return ctrl.Result{}, nil
 		}
 		client, err := req.replClientSet.currentPrimaryClient(ctx)
 		if err != nil {
@@ -482,24 +482,14 @@ func podIsSpecPrimary(req *ReconcileRequest, podIndex int) bool {
 	return replication.Primary.PodIndex != nil && *replication.Primary.PodIndex == podIndex
 }
 
-// shouldReassertPrimaryWritable gates the read_only=OFF assertion on the current primary.
-// Explicitly requested read-only (maintenance mode) must survive, and an in-flight
-// switchover has its own handling of the primary's read_only.
-func shouldReassertPrimaryWritable(mdb *mariadbv1alpha1.MariaDB) bool {
-	return !mdb.IsReadOnlyEnabled() && !mdb.IsSwitchingPrimary() && !mdb.IsReplicationSwitchoverRequired()
-}
-
-// assertPrimaryWritable makes read_only=OFF true of the current primary. The mirror of
-// assertReplicaReadOnly: read_only is a runtime SET GLOBAL written only on role changes, so
-// a primary that restarts into read_only — or one that a failed switchover or the
-// maintenance reconciler left read-only — stays read-only forever: role inference
-// classifies the pod as primary and the steady-state ConfigurePrimary path is skipped.
-// Deliberately non-fatal, same as its mirror.
+// assertPrimaryWritable makes read_only=OFF true of the current primary, right after
+// ConfigurePrimary has run. It is a cheap invariant assertion — one SELECT on the
+// non-skipped primary reconcile path: restarts self-heal because read_only is a
+// runtime SET GLOBAL that is not persisted, and maintenance mode owns read_only via
+// the maintenance controller. Deliberately non-fatal, same as its mirror
+// assertReplicaReadOnly.
 func (r *ReplicationReconciler) assertPrimaryWritable(ctx context.Context, req *ReconcileRequest, pod string,
 	logger logr.Logger) error {
-	if !shouldReassertPrimaryWritable(req.mariadb) {
-		return nil
-	}
 	client, err := req.replClientSet.currentPrimaryClient(ctx)
 	if err != nil {
 		logger.V(1).Info("error getting primary client to assert read_only", "err", err, "pod", pod)
