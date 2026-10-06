@@ -396,6 +396,7 @@ replication; the verdicts:
 | 13, 14 | carried |
 | — | the 3s replication-client connect deadline that rode along with 12/13 is dropped: CI on 26.10.1 lost a different "becomes Ready" spec on every run with it and none without it; the driver's 5s dial timeout already bounds a connect to a dead primary |
 | 15 | new — upstream #1815 open |
+| 16 | upstream [PR #1941](https://github.com/mariadb-operator/mariadb-operator/pull/1941) cherry-picked (open upstream): 26.10.1 sends `MASTER_DEMOTE_TO_SLAVE` to `Current_Pos` replicas, Error 4191 ([#1936](https://github.com/mariadb-operator/mariadb-operator/issues/1936)); it looped edunorm-productionv2's switchover on the 26.10.1-teda.1 rollout and blocked writes for ~5 min. Drop once upstream merges it |
 
 What `26.6.0` did change in this area is a refactor: `replConfigClient` became
 `topologyManager.TopologyForMariaDB(...)`. Patches 2–6 were re-applied against
