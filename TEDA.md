@@ -394,6 +394,7 @@ replication; the verdicts:
 | 11 | dropped — see 6 |
 | 12 | carried, and extended to zstd, which upstream added |
 | 13, 14 | carried |
+| — | the 3s replication-client connect deadline that rode along with 12/13 is dropped: CI on 26.10.1 lost a different "becomes Ready" spec on every run with it and none without it; the driver's 5s dial timeout already bounds a connect to a dead primary |
 | 15 | new — upstream #1815 open |
 
 What `26.6.0` did change in this area is a refactor: `replConfigClient` became

@@ -132,10 +132,6 @@ type Client struct {
 }
 
 func NewClient(clientOpts ...Opt) (*Client, error) {
-	return newClient(context.Background(), clientOpts...)
-}
-
-func newClient(ctx context.Context, clientOpts ...Opt) (*Client, error) {
 	opts := Opts{}
 	for _, setOpt := range clientOpts {
 		setOpt(&opts)
@@ -144,7 +140,7 @@ func newClient(ctx context.Context, clientOpts ...Opt) (*Client, error) {
 	if err != nil {
 		return nil, fmt.Errorf("error building DSN: %v", err)
 	}
-	db, err := ConnectContext(ctx, dsn)
+	db, err := Connect(dsn)
 	if err != nil {
 		return nil, err
 	}
@@ -209,7 +205,7 @@ func NewClientWithMariaDB(ctx context.Context, mariadb interfaces.MariaDBObject,
 	}
 
 	opts = append(opts, clientOpts...)
-	return newClient(ctx, opts...)
+	return NewClient(opts...)
 }
 
 func NewInternalClientWithPodIndex(ctx context.Context, mariadb *mariadbv1alpha1.MariaDB, refResolver *refresolver.RefResolver,
@@ -252,7 +248,7 @@ func NewLocalClientWithPodEnv(ctx context.Context, env *environment.PodEnvironme
 	}
 
 	opts = append(opts, clientOpts...)
-	return newClient(ctx, opts...)
+	return NewClient(opts...)
 }
 
 func BuildDSN(opts Opts) (string, error) {
@@ -350,15 +346,11 @@ func configTLSName(opts Opts) (string, error) {
 }
 
 func Connect(dsn string) (*sql.DB, error) {
-	return ConnectContext(context.Background(), dsn)
-}
-
-func ConnectContext(ctx context.Context, dsn string) (*sql.DB, error) {
 	db, err := sql.Open("mysql", dsn)
 	if err != nil {
 		return nil, err
 	}
-	if err := db.PingContext(ctx); err != nil {
+	if err := db.PingContext(context.Background()); err != nil {
 		db.Close()
 		return nil, err
 	}
