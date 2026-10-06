@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"time"
 
 	mariadbv1alpha1 "github.com/mariadb-operator/mariadb-operator/v26/api/v1alpha1"
 	"github.com/mariadb-operator/mariadb-operator/v26/pkg/refresolver"
@@ -29,12 +28,7 @@ func (c *ReplicationClientSet) close() error {
 	return c.Close()
 }
 
-const defaultReplicationClientTimeout = 3 * time.Second
-
 func (c *ReplicationClientSet) clientForIndex(ctx context.Context, index int, clientOpts ...sqlClient.Opt) (*sqlClient.Client, error) {
-	ctx, cancel := context.WithTimeout(ctx, defaultReplicationClientTimeout)
-	defer cancel()
-	clientOpts = append([]sqlClient.Opt{sqlClient.WithTimeout(defaultReplicationClientTimeout)}, clientOpts...)
 	return c.ClientForIndex(ctx, index, clientOpts...)
 }
 

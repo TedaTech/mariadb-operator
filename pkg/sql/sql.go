@@ -144,7 +144,7 @@ func newClient(ctx context.Context, clientOpts ...Opt) (*Client, error) {
 	if err != nil {
 		return nil, fmt.Errorf("error building DSN: %v", err)
 	}
-	db, err := ConnectContext(ctx, dsn)
+	db, err := Connect(dsn)
 	if err != nil {
 		return nil, err
 	}
