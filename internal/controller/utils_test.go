@@ -1256,6 +1256,21 @@ func deleteMariadb(key types.NamespacedName, assertPVCDeletion bool) {
 		return apierrors.IsNotFound(err)
 	}, testTimeout, testInterval).Should(BeTrue())
 
+	By("Expecting the StatefulSet and its Pods to be deleted")
+	Eventually(func(g Gomega) bool {
+		var sts appsv1.StatefulSet
+		if err := k8sClient.Get(testCtx, key, &sts); !apierrors.IsNotFound(err) {
+			return false
+		}
+		var pods corev1.PodList
+		g.Expect(k8sClient.List(testCtx, &pods, client.InNamespace(key.Namespace), client.MatchingLabels(
+			labels.NewLabelsBuilder().
+				WithMariaDBSelectorLabels(&mdb).
+				Build(),
+		))).To(Succeed())
+		return len(pods.Items) == 0
+	}, testHighTimeout, testInterval).Should(BeTrue())
+
 	By("Deleting PVCs")
 	opts := []client.DeleteAllOfOption{
 		client.MatchingLabels(
