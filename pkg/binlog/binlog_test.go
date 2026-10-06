@@ -11,6 +11,7 @@ import (
 	"github.com/google/go-cmp/cmp"
 	mariadbrepl "github.com/mariadb-operator/mariadb-operator/v26/pkg/replication"
 	"github.com/stretchr/testify/assert"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/yaml"
 )
 
@@ -43,6 +44,18 @@ func TestBuildTimeline(t *testing.T) {
 			strictMode: true,
 			wantPath:   nil,
 			wantErr:    true,
+		},
+		{
+			name:       "binlog numbering restarted: the new lineage is replayed, not the reused names",
+			indexFile:  mustParseTestFile(t, "reused-filenames.yaml"),
+			startGtid:  mustParseGtid(t, "0-10-510"),
+			targetTime: mustParseDate(t, "2026-10-05T18:40:00Z"),
+			strictMode: true,
+			wantPath: []string{
+				"server-10/mariadb-repl-bin.000001.1791216000",
+				"server-10/mariadb-repl-bin.000002.1791219600",
+			},
+			wantErr: false,
 		},
 		{
 			name:       "multiple binlogs",
@@ -300,4 +313,74 @@ func getBinlogTimeline(binlogMetas []BinlogMetadata) []string {
 		path[i] = binlogMeta.ObjectStoragePath()
 	}
 	return path
+}
+
+func TestObjectStoragePath(t *testing.T) {
+	firstTime := metav1.NewTime(time.Date(2026, 10, 6, 8, 0, 0, 0, time.UTC))
+	tests := map[string]struct {
+		meta BinlogMetadata
+		want string
+	}{
+		"legacy entry without object name keeps the filename key": {
+			meta: BinlogMetadata{ServerId: 10, BinlogFilename: "mariadb-bin.000049", FirstTime: firstTime},
+			want: "server-10/mariadb-bin.000049",
+		},
+		"new entry is keyed by filename and first event time": {
+			meta: BinlogMetadata{
+				ServerId:       10,
+				BinlogFilename: "mariadb-bin.000049",
+				FirstTime:      firstTime,
+				ObjectName:     newObjectName("mariadb-bin.000049", firstTime),
+			},
+			want: "server-10/mariadb-bin.000049.1791273600",
+		},
+	}
+	for name, tt := range tests {
+		t.Run(name, func(t *testing.T) {
+			if got := tt.meta.ObjectStoragePath(); got != tt.want {
+				t.Errorf("ObjectStoragePath() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestBinlogIndexKeepsReusedFilenames(t *testing.T) {
+	archived := BinlogMetadata{
+		ServerId:       10,
+		BinlogFilename: "mariadb-bin.000001",
+		FirstTime:      metav1.NewTime(time.Date(2026, 7, 14, 18, 0, 0, 0, time.UTC)),
+	}
+	reused := BinlogMetadata{
+		ServerId:       10,
+		BinlogFilename: "mariadb-bin.000001",
+		FirstTime:      metav1.NewTime(time.Date(2026, 10, 6, 8, 0, 0, 0, time.UTC)),
+	}
+
+	index := NewBinlogIndex()
+	index.Add(10, archived)
+
+	if !index.Exists(&archived) {
+		t.Error("Exists() = false for the archived binlog, want true")
+	}
+	if index.Exists(&reused) {
+		t.Error("Exists() = true for a new binlog that only reuses the filename, want false")
+	}
+}
+
+func TestBinlogIndexRecognisesLegacyEntries(t *testing.T) {
+	firstTime := metav1.NewTime(time.Date(2026, 10, 6, 8, 0, 0, 0, time.UTC))
+	legacy := BinlogMetadata{ServerId: 10, BinlogFilename: "mariadb-bin.000049", FirstTime: firstTime}
+	sameBinlogReparsed := BinlogMetadata{
+		ServerId:       10,
+		BinlogFilename: "mariadb-bin.000049",
+		FirstTime:      firstTime,
+		ObjectName:     "mariadb-bin.000049.1791273600",
+	}
+
+	index := NewBinlogIndex()
+	index.Add(10, legacy)
+
+	if !index.Exists(&sameBinlogReparsed) {
+		t.Error("Exists() = false for a binlog already indexed under its legacy key, want true")
+	}
 }

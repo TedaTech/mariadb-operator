@@ -49,6 +49,9 @@ const (
 	ReasonPrimarySwitching = "PrimarySwitching"
 	// ReasonPrimarySwitched indicates that primary has been switched.
 	ReasonPrimarySwitched = "PrimarySwitched"
+	// ReasonPrimarySwitchNoCandidates indicates that an automatic failover was
+	// skipped because no replica qualified for promotion.
+	ReasonPrimarySwitchNoCandidates = "PrimarySwitchNoCandidates"
 
 	// ReasonMaxScalePrimaryServerChanged indicates that the primary server managed by MaxScale has changed.
 	ReasonMaxScalePrimaryServerChanged = "MaxScalePrimaryServerChanged"
@@ -79,6 +82,11 @@ const (
 
 	// ReasonMariaDBReplicaRecoveryError indicates that an error has occurred during the MariaDB instance replica recovery operation.
 	ReasonMariaDBReplicaRecoveryError = "MariaDBReplicaRecoveryError"
+
+	// ReasonInitJobRetried indicates that a failed PhysicalBackup init job is being deleted so it can run again.
+	ReasonInitJobRetried = "InitJobRetried"
+	// ReasonInitJobFailed indicates that a PhysicalBackup init job failed and was not re-fired, manual intervention is required.
+	ReasonInitJobFailed = "InitJobFailed"
 
 	// ReasonBinlogArchivalError indicates that an error has occurred when archiving binary logs.
 	ReasonBinlogArchivalError = "BinlogArchivalError"

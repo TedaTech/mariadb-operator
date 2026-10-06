@@ -866,6 +866,13 @@ func (c *Client) BinaryLogIndex(ctx context.Context) (string, error) {
 	return c.SystemVariable(ctx, "log_bin_index")
 }
 
+// FlushBinaryLogs closes the active binary log and opens a new one. The archiver
+// never ships the active binary log, so without a rotation everything written
+// since the last one is unarchivable.
+func (c *Client) FlushBinaryLogs(ctx context.Context) error {
+	return c.Exec(ctx, "FLUSH BINARY LOGS;")
+}
+
 func (c *Client) GtidBinlogPos(ctx context.Context) (string, error) {
 	return c.SystemVariable(ctx, "gtid_binlog_pos")
 }
@@ -949,6 +956,20 @@ func (c Client) IsReplicationRunning(ctx context.Context, logger logr.Logger, re
 	}
 	return replicaStatus.SlaveIORunning != nil && *replicaStatus.SlaveIORunning &&
 		replicaStatus.SlaveSQLRunning != nil && *replicaStatus.SlaveSQLRunning, nil
+}
+
+// ReplicaMasterHost returns the host this replica is configured to replicate
+// from, or "" when it is not replicating at all.
+//
+// Master_Host is the only way to tell a replica that is merely lagging from one
+// that is faithfully following a primary which no longer exists: both keep
+// Slave_SQL_Running=Yes and simply never advance.
+func (c Client) ReplicaMasterHost(ctx context.Context) (string, error) {
+	row, err := c.QueryColumnMap(ctx, "SHOW REPLICA STATUS")
+	if err != nil {
+		return "", fmt.Errorf("error getting replica status: %v", err)
+	}
+	return row["Master_Host"], nil
 }
 
 // See: https://mariadb.com/docs/server/reference/sql-statements/administrative-sql-statements/show/show-replica-status

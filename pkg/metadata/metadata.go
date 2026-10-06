@@ -27,5 +27,9 @@ var (
 
 	WebhookConfigAnnotation = "k8s.mariadb.com/webhook"
 
+	// PbInitRetryAnnotationPrefix tracks how many times a failed PhysicalBackup init
+	// job has been re-fired, per Pod (the pod name is appended to the key).
+	PbInitRetryAnnotationPrefix = "k8s.mariadb.com/pb-init-retry-"
+
 	MetaCtrlFieldPath = ".metadata.controller"
 )
