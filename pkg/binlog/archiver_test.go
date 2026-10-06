@@ -89,3 +89,66 @@ func TestShouldRotateBinlog(t *testing.T) {
 		})
 	}
 }
+
+func TestBinlogNumberingRestarted(t *testing.T) {
+	archivedAt := metav1.NewTime(time.Date(2026, 9, 30, 18, 1, 8, 0, time.UTC))
+	status := &mariadbv1alpha1.MariaDBPointInTimeRecoveryStatus{
+		LastArchivedBinaryLog: "mariadb-bin.000005",
+		LastArchivedTime:      archivedAt,
+		LastArchivedPosition:  8864,
+	}
+	tests := map[string]struct {
+		status             *mariadbv1alpha1.MariaDBPointInTimeRecoveryStatus
+		newest             string
+		lastArchivedOnDisk *BinlogMetadata
+		want               bool
+	}{
+		"nothing archived yet": {
+			status: nil,
+			newest: "mariadb-bin.000003",
+			want:   false,
+		},
+		"numbering continues, archived binlog still on disk": {
+			status:             status,
+			newest:             "mariadb-bin.000007",
+			lastArchivedOnDisk: &BinlogMetadata{LastTime: archivedAt, LogPosition: 8864},
+			want:               false,
+		},
+		"numbering continues, archived binlog purged": {
+			status: status,
+			newest: "mariadb-bin.000007",
+			want:   false,
+		},
+		"no new binlog since the last archival": {
+			status:             status,
+			newest:             "mariadb-bin.000005",
+			lastArchivedOnDisk: &BinlogMetadata{LastTime: archivedAt, LogPosition: 8864},
+			want:               false,
+		},
+		"numbering restarted below the archived number": {
+			status: status,
+			newest: "mariadb-bin.000003",
+			want:   true,
+		},
+		"numbering restarted and already past the archived number": {
+			status: status,
+			newest: "mariadb-bin.000007",
+			lastArchivedOnDisk: &BinlogMetadata{
+				LastTime:    metav1.NewTime(time.Date(2026, 10, 5, 17, 0, 0, 0, time.UTC)),
+				LogPosition: 1204,
+			},
+			want: true,
+		},
+	}
+	for name, tt := range tests {
+		t.Run(name, func(t *testing.T) {
+			got, err := binlogNumberingRestarted(tt.status, tt.newest, tt.lastArchivedOnDisk)
+			if err != nil {
+				t.Fatalf("binlogNumberingRestarted() error = %v", err)
+			}
+			if got != tt.want {
+				t.Errorf("binlogNumberingRestarted() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}

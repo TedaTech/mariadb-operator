@@ -26,12 +26,18 @@ replica permanently stuck `Init`ing. See commits 9–13:
   event, just `Ready=False` and a pod whose init container waits on a field that
   is only cleared after the job completes. See commit 13.
 
-Base: upstream tag `v26.6.0`. Working branch: `teda/26.6.0`.
-Image: `ghcr.io/tedatech/mariadb-operator:26.6.0-teda.N`.
+And one more, found in production on 2026-10-06: **binary logs whose numbering
+restarted are never archived**, while the archiver reports success. See commit
+15.
+
+Base: upstream tag `v26.10.1`. Working branch: `teda/26.10.1`.
+Image: `ghcr.io/tedatech/mariadb-operator:26.10.1-teda.N`.
 
 Everything here is a bug fix against upstream behaviour. There are no new API
 fields, no CRD changes, and no new configuration — the CRDs from upstream
-`26.6.0` are used unmodified.
+`26.10.1` are used unmodified. The only new persisted field is `objectName` in
+the PITR archive's own `index.yaml` (commit 15), which makes that release
+forward-only: an older build cannot find archives written by it.
 
 ## The one cause
 
@@ -64,15 +70,16 @@ in CI until 2026-08-21 — see its section.
 | 3 | `fix(switchover): reconnect replicas whose primary is gone` | not filed |
 | 4 | `fix(status): infer Primary from currentPrimaryPodIndex` | not filed |
 | 5 | `fix(replication): repair a replica following a dead primary` | not filed |
-| 6 | `fix(replication): re-assert read_only on replicas every reconcile` | [#1719](https://github.com/mariadb-operator/mariadb-operator/issues/1719) |
+| 6 | ~~`fix(replication): re-assert read_only on replicas every reconcile`~~ | **dropped in 26.10.1**: the maintenance phase converges `read_only` on every Pod on every reconcile |
 | 7 | `fix(binlog): rotate the active binary log when archival is overdue` | not filed |
-| 8 | `fix(switchover): survive a switchover with point-in-time recovery enabled` | [#1669](https://github.com/mariadb-operator/mariadb-operator/issues/1669) is the mirror image (open, stale-botted); the 1947 case is not filed |
-| 9 | `fix(switchover): fall through a tolerated 1948 instead of skipping read_only reset` | upstream `e3e07c62` (in 26.6.0) created the tolerance; the swallow is not filed |
-| 10 | `fix(switchover): fail the promotion phase when the new primary is still read_only` | not filed |
-| 11 | `fix(replication): re-assert read_only=OFF on the primary every reconcile` | [#1719](https://github.com/mariadb-operator/mariadb-operator/issues/1719) is the mirror image (demoted node stays writable; patch 6 covers it) |
+| 8 | `fix(switchover): survive a switchover with point-in-time recovery enabled` — **reduced in 26.10.1** to the 1947 tolerance and the re-entrant replica sync; the early status commit and the `ResetMaster` guard are gone, see the 26.10.1 table | [#1669](https://github.com/mariadb-operator/mariadb-operator/issues/1669) is the mirror image (open, stale-botted); the 1947 case is not filed |
+| 9 | ~~`fix(switchover): fall through a tolerated 1948 instead of skipping read_only reset`~~ | **dropped in 26.10.1**: fixed upstream by `cd51735f` |
+| 10 | ~~`fix(switchover): fail the promotion phase when the new primary is still read_only`~~ | **dropped in 26.10.1**: contradicts upstream, which keeps a promoted node `read_only` until semi-sync is armed (`16cca7ce`) |
+| 11 | ~~`fix(replication): re-assert read_only=OFF on the primary every reconcile`~~ | **dropped in 26.10.1**: the maintenance phase owns `read_only` |
 | 12 | `fix(backup): make compression idempotent to stop double-compressed backups` | not filed |
 | 13 | `fix(init): re-fire a failed PhysicalBackup init job instead of waiting forever` | not filed |
 | 14 | `fix(replication): configure the primary at least once on a fresh cluster` | matches upstream [#1692](https://github.com/mariadb-operator/mariadb-operator/issues/1692) and [#1730](https://github.com/mariadb-operator/mariadb-operator/issues/1730) (both open); a regression in this fork's own commit 4, caught by CI on 2026-08-21 |
+| 15 | `fix(binlog): archive binary logs whose numbering restarted` | [#1815](https://github.com/mariadb-operator/mariadb-operator/issues/1815) (open, no fix); upstream [PR #1883](https://github.com/mariadb-operator/mariadb-operator/pull/1883), in 26.10.1, removes the `RESET MASTER` that triggered it on replica configuration, not every restart |
 
 Commits 1 and 3 are the two that make failover complete at all. 5 and 6 are the
 ones that act in steady state on a healthy cluster — check those first if a
@@ -317,6 +324,33 @@ pod pass. A fresh cluster always runs `ConfigurePrimary` at least once;
 a converged cluster — and the post-failover case commit 4 was written for —
 behave exactly as before. The multi-cluster branch is untouched.
 
+### 13 — reused binary log names are never archived (commit 15)
+
+The archiver keyed archived binary logs by filename: object
+`server-<id>/<filename>`, index entry deduplicated on `binlogFilename`. A
+server whose numbering restarts — `RESET MASTER` on a re-initialised replica
+that later becomes primary — writes `…bin.000001` again. The upload is skipped
+because the object exists, the index entry is skipped because the filename
+exists, and the agent still logs `Binary log … archived` and advances
+`status.pointInTimeRecovery.lastArchived*`. Every archival alert stays green;
+only `lastRecoverableTime` freezes, because no base backup can anchor in a
+binary log that never reached the archive.
+
+tdconnect-production, 2026-09-30 → 2026-10-06: last real upload `000272`,
+then five primary flips and a re-clone; six days of binary logs were never
+archived. The tell is `Binary log … archived` with no `Uploading binary log`
+before it.
+
+New archives are keyed `server-<id>/<filename>.<first event unix time>` and
+the key is recorded as `objectName` in the index; entries without it keep the
+old key, so existing archives still restore. The archiver indexes exactly the
+binary logs it uploaded, deduplicated on filename plus first event time, so a
+binary log indexed under its old key is not indexed again under the new one. A
+restart is detected when the local file named `lastArchivedBinaryLog` no longer
+matches the archived one (end position, last event time), or is gone while
+newer numbers are lower. Either resets the archival status, the same as a
+`server_id` change, so a restarted sequence is not skipped by number.
+
 ## Evidence
 
 kind, 5 nodes, k8s v1.35, 3-replica MariaDB with `autoFailover: true`, then
@@ -345,6 +379,22 @@ Upgrading is not a fix. Every one of the defects was re-verified against
 Defect 8 was found *after* that rebase, in production, on this fork. `26.6.0`
 made it visible rather than causing it: picking up the 1948 tolerance is what
 let the promotion phase succeed, so the failure moved to the phase after it.
+
+Rebased onto `26.10.1` on 2026-10-06. 161 upstream commits, most of them in
+replication; the verdicts:
+
+| Patch | Status in `26.10.1` |
+|---|---|
+| 1–5 | applied cleanly; upstream code on those paths unchanged |
+| 6 | dropped — `pkg/controller/maintenance/read_only.go` converges `read_only` on every Pod every reconcile, unconditionally without MaxScale |
+| 7 | carried — upstream has no rotation on `archiveTimeout` |
+| 8 | reduced — upstream `bef96546` removed `RESET MASTER` from replica configuration, so the `ResetMaster` guard has nothing to guard; `16cca7ce` keeps the new primary `read_only` until its last phase, so committing status earlier would point the Service at a read-only node. Kept: the 1947 tolerance in `ConfigureReplica` and the re-entrant replica sync |
+| 9 | dropped — `cd51735f` |
+| 10 | dropped — contradicts `16cca7ce` |
+| 11 | dropped — see 6 |
+| 12 | carried, and extended to zstd, which upstream added |
+| 13, 14 | carried |
+| 15 | new — upstream #1815 open |
 
 What `26.6.0` did change in this area is a refactor: `replConfigClient` became
 `topologyManager.TopologyForMariaDB(...)`. Patches 2–6 were re-applied against

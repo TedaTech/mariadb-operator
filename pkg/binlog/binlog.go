@@ -27,13 +27,13 @@ type BinlogIndex struct {
 	Binlogs map[string][]BinlogMetadata `json:"binlogs"`
 }
 
-func (b *BinlogIndex) Exists(serverId uint32, binlog string) bool {
-	binlogs, ok := b.Binlogs[serverKey(serverId)]
+func (b *BinlogIndex) Exists(binlog *BinlogMetadata) bool {
+	binlogs, ok := b.Binlogs[serverKey(binlog.ServerId)]
 	if !ok {
 		return false
 	}
 	return datastructures.Any(binlogs, func(meta BinlogMetadata) bool {
-		return meta.BinlogFilename == binlog
+		return meta.BinlogFilename == binlog.BinlogFilename && meta.FirstTime.Equal(&binlog.FirstTime)
 	})
 }
 
@@ -283,6 +283,7 @@ type BinlogMetadata struct {
 	ServerVersion  string              `json:"serverVersion"`
 	BinlogVersion  uint16              `json:"binlogVersion"`
 	BinlogFilename string              `json:"binlogFilename"`
+	ObjectName     string              `json:"objectName,omitempty"`
 	LogPosition    uint32              `json:"logPosition"`
 	FirstTime      metav1.Time         `json:"firstTime"`
 	LastTime       metav1.Time         `json:"lastTime"`
@@ -294,7 +295,15 @@ type BinlogMetadata struct {
 }
 
 func (b *BinlogMetadata) ObjectStoragePath() string {
-	return fmt.Sprintf("%s/%s", serverKey(b.ServerId), b.BinlogFilename)
+	name := b.ObjectName
+	if name == "" {
+		name = b.BinlogFilename
+	}
+	return fmt.Sprintf("%s/%s", serverKey(b.ServerId), name)
+}
+
+func newObjectName(binlogFilename string, firstTime metav1.Time) string {
+	return fmt.Sprintf("%s.%d", binlogFilename, firstTime.Unix())
 }
 
 func GetBinlogMetadata(binlogPath string, logger logr.Logger) (*BinlogMetadata, error) {
@@ -394,6 +403,7 @@ func GetBinlogMetadata(binlogPath string, logger logr.Logger) (*BinlogMetadata, 
 		meta.LastGtid = gtid
 	}
 
+	meta.ObjectName = newObjectName(meta.BinlogFilename, meta.FirstTime)
 	return &meta, nil
 }
 
