@@ -117,7 +117,7 @@ func (r *PodReplicationController) ReconcilePodNotReady(ctx context.Context, pod
 		// is indistinguishable from "no failover was needed".
 		logger.Error(err, "Unable to select a promotion candidate, automatic failover skipped", "primary", *primary)
 		r.recorder.Eventf(mariadb, nil, corev1.EventTypeWarning, mariadbv1alpha1.ReasonPrimarySwitchNoCandidates,
-			mariadbv1alpha1.ActionReconciling,
+			mariadbv1alpha1.ReasonPrimarySwitchNoCandidates,
 			"Automatic failover from primary index '%d' skipped: %v", *primary, err)
 		return fmt.Errorf("error getting promotion candidate: %v", err)
 	}
