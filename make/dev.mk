@@ -33,7 +33,7 @@ test: envtest ginkgo ## Run unit tests.
 
 .PHONY: test-int-basic
 test-int-basic: envtest ginkgo ## Run integration tests with label 'basic'
-	$(MAKE) TEST_ARGS="--label-filter=basic" test-int
+	$(MAKE) TEST_ARGS="--focus='should reconcile with MaxScale|TLS with cert-manager|from volume snapshot'" test-int
 
 .PHONY: test-int
 test-int: envtest ginkgo ## Run integration tests, excluding feature-specific tests.
