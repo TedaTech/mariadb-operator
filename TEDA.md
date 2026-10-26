@@ -21,7 +21,7 @@ replica permanently stuck `Init`ing. See commits 9–13:
   1948 by *returning early*, skipping the very step that makes the node
   writable. See commit 9.
 - **A retried backup object is double-compressed** and becomes unrestorable
-  (`wrong chunk magic at offset 0x0`). See commit 12.
+  (`wrong chunk magic at offset 0x0`). See commit 12; fixed upstream in `26.10.2`.
 - **A failed `pb-init` job wedges replica recovery forever** — no re-fire, no
   event, just `Ready=False` and a pod whose init container waits on a field that
   is only cleared after the job completes. See commit 13.
@@ -30,12 +30,12 @@ And one more, found in production on 2026-10-06: **binary logs whose numbering
 restarted are never archived**, while the archiver reports success. See commit
 15.
 
-Base: upstream tag `v26.10.1`. Working branch: `teda/26.10.1`.
-Image: `ghcr.io/tedatech/mariadb-operator:26.10.1-teda.N`.
+Base: upstream tag `v26.10.2`. Working branch: `teda/26.10.2`.
+Image: `ghcr.io/tedatech/mariadb-operator:26.10.2-teda.N`.
 
 Everything here is a bug fix against upstream behaviour. There are no new API
 fields, no CRD changes, and no new configuration — the CRDs from upstream
-`26.10.1` are used unmodified. The only new persisted field is `objectName` in
+`26.10.2` are used unmodified. The only new persisted field is `objectName` in
 the PITR archive's own `index.yaml` (commit 15), which makes that release
 forward-only: an older build cannot find archives written by it.
 
@@ -76,10 +76,11 @@ in CI until 2026-08-21 — see its section.
 | 9 | ~~`fix(switchover): fall through a tolerated 1948 instead of skipping read_only reset`~~ | **dropped in 26.10.1**: fixed upstream by `cd51735f` |
 | 10 | ~~`fix(switchover): fail the promotion phase when the new primary is still read_only`~~ | **dropped in 26.10.1**: contradicts upstream, which keeps a promoted node `read_only` until semi-sync is armed (`16cca7ce`) |
 | 11 | ~~`fix(replication): re-assert read_only=OFF on the primary every reconcile`~~ | **dropped in 26.10.1**: the maintenance phase owns `read_only` |
-| 12 | `fix(backup): make compression idempotent to stop double-compressed backups` | not filed |
+| 12 | ~~`fix(backup): make compression idempotent to stop double-compressed backups`~~ | **dropped in 26.10.2**: fixed upstream by `cdc262fd` ([#1850](https://github.com/mariadb-operator/mariadb-operator/issues/1850)) |
 | 13 | `fix(init): re-fire a failed PhysicalBackup init job instead of waiting forever` | not filed |
 | 14 | `fix(replication): configure the primary at least once on a fresh cluster` | matches upstream [#1692](https://github.com/mariadb-operator/mariadb-operator/issues/1692) and [#1730](https://github.com/mariadb-operator/mariadb-operator/issues/1730) (both open); a regression in this fork's own commit 4, caught by CI on 2026-08-21 |
 | 15 | `fix(binlog): archive binary logs whose numbering restarted` | [#1815](https://github.com/mariadb-operator/mariadb-operator/issues/1815) (open, no fix); upstream [PR #1883](https://github.com/mariadb-operator/mariadb-operator/pull/1883), in 26.10.1, removes the `RESET MASTER` that triggered it on replica configuration, not every restart |
+| 16 | ~~`fix(replication): set MASTER_USE_GTID=slave_pos when demoting`~~ | **dropped in 26.10.2**: upstream [PR #1941](https://github.com/mariadb-operator/mariadb-operator/pull/1941) merged as `e071201b` |
 
 Commits 1 and 3 are the two that make failover complete at all. 5 and 6 are the
 ones that act in steady state on a healthy cluster — check those first if a
@@ -254,6 +255,8 @@ Known gap below.
 
 ### 10 — a retried backup is double-compressed (commit 12)
 
+Fixed upstream in `26.10.2` by `cdc262fd`; kept here as the record of the incident.
+
 `compressFile` replaces the plain file in place (`file.tmp` → `file`), and the
 backup command re-runs `Compress` over the same path whenever its container is
 restarted (`RestartPolicy: OnFailure`). The second pass compresses the stream
@@ -394,7 +397,20 @@ replication; the verdicts:
 | 11 | dropped — see 6 |
 | 12 | carried, and extended to zstd, which upstream added |
 | 13, 14 | carried |
+| — | the 3s replication-client connect deadline that rode along with 12/13 is dropped: CI on 26.10.1 lost a different "becomes Ready" spec on every run with it and none without it; the driver's 5s dial timeout already bounds a connect to a dead primary |
 | 15 | new — upstream #1815 open |
+| 16 | upstream [PR #1941](https://github.com/mariadb-operator/mariadb-operator/pull/1941) cherry-picked (open upstream): 26.10.1 sends `MASTER_DEMOTE_TO_SLAVE` to `Current_Pos` replicas, Error 4191 ([#1936](https://github.com/mariadb-operator/mariadb-operator/issues/1936)); it looped edunorm-productionv2's switchover on the 26.10.1-teda.1 rollout and blocked writes for ~5 min. Drop once upstream merges it |
+
+Rebased onto `26.10.2` on 2026-10-26. 87 upstream commits; the verdicts:
+
+| Patch | Status in `26.10.2` |
+|---|---|
+| 1–5, 7, 8 | carried; applied cleanly except 8, whose `ReconcileRequest` now sits beside upstream's MaxScale-inferred `currentPrimaryPodIndex` (`d84f72c5`). The switchover phases still read `status.currentPrimaryPodIndex`, so `fromPrimaryPodIndex` keeps falling back to the status |
+| 12 | dropped — `cdc262fd` skips compression when the file already starts with the target format's magic, for gzip, bzip2 and zstd; upstream's `TestBackupCompressors` compresses twice and round-trips |
+| 13 | carried — `58ddf0d1` stops re-creating the init Job of a Pod that is already running ([#1629](https://github.com/mariadb-operator/mariadb-operator/issues/1629)); a *failed* job is still waited on forever |
+| 14 | carried — `e6ea056f` requeues while the primary has *no* role on a fresh cluster; commit 4 gives it role `Primary` early, which upstream's `shouldSkipPrimaryReconciliation` still skips on |
+| 15 | carried — `16287bf0` changed `BuildTimeline` around it without conflict |
+| 16 | dropped — `e071201b` is the merged form of PR #1941 |
 
 What `26.6.0` did change in this area is a refactor: `replConfigClient` became
 `topologyManager.TopologyForMariaDB(...)`. Patches 2–6 were re-applied against
