@@ -83,6 +83,11 @@ const (
 	// ReasonMariaDBReplicaRecoveryError indicates that an error has occurred during the MariaDB instance replica recovery operation.
 	ReasonMariaDBReplicaRecoveryError = "MariaDBReplicaRecoveryError"
 
+	// ReasonInitJobRetried indicates that a failed PhysicalBackup init job is being deleted so it can run again.
+	ReasonInitJobRetried = "InitJobRetried"
+	// ReasonInitJobFailed indicates that a PhysicalBackup init job failed and was not re-fired, manual intervention is required.
+	ReasonInitJobFailed = "InitJobFailed"
+
 	// ReasonBinlogArchivalError indicates that an error has occurred when archiving binary logs.
 	ReasonBinlogArchivalError = "BinlogArchivalError"
 
