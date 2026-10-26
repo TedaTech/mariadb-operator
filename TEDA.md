@@ -273,8 +273,8 @@ turn made the `pb-init` job fail, which wedged the recovery (commit 13). Any
 backup — scheduled or recovery — could hit it; nothing else flagged it,
 because the archive looked fine and only restore noticed.
 
-The fix skips compressing a file that already starts with a gzip (`1f 8b`) or
-bzip2 (`BZh`) header. A plain mariadb-backup stream starts with the xbstream
+The fix, now upstream's, skips compressing a file that already starts with the
+target format's magic: gzip (`1f 8b`), bzip2 (`BZh`) or zstd (`28 b5 2f fd`). A plain mariadb-backup stream starts with the xbstream
 header, never either magic, so a genuine plain backup is never skipped. The
 also-obvious fix, `RestartPolicy: Never`, is applied by users, not by us; the
 sniff protects whatever the policy is.
@@ -423,8 +423,8 @@ the replicas hit `Error 1236 ... GTID not in the master's binlog` — the
 promotion `RESET MASTER` trap. Upstream's designed answer is
 `spec.replication.replica.recovery` + `bootstrapFrom`, which our production
 clusters do configure, but the full reattachment of a *returning ex-primary*
-after a failover has **not** been proven in a drill. Commits 12 and 13 make
-the recovery path reachable and self-healing; 9–11 make the promoted primary
+after a failover has **not** been proven in a drill. Commit 13 and upstream's
+`cdc262fd` (formerly commit 12) make the recovery path reachable and self-healing; 9–11 make the promoted primary
 writable. What remains unproven is the last half hour of a failover: the old
 primary coming back and re-joining as a replica. Until the drill covers it,
 treat a real failover as something to watch rather than something to trust.
