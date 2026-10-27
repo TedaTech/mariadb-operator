@@ -1,0 +1,33 @@
+apiVersion: v1
+binlogs:
+  server-10:
+  - serverId: 10
+    binlogFilename: mariadb-repl-bin.000001
+    firstTime: "2026-07-14T18:00:00Z"
+    lastTime: "2026-07-14T19:00:00Z"
+    firstGtid: 0-10-1
+    lastGtid: 0-10-50
+    rotateEvent: true
+  - serverId: 10
+    binlogFilename: mariadb-repl-bin.000002
+    firstTime: "2026-07-14T19:00:00Z"
+    lastTime: "2026-07-14T20:00:00Z"
+    firstGtid: 0-10-51
+    lastGtid: 0-10-90
+    rotateEvent: true
+  - serverId: 10
+    binlogFilename: mariadb-repl-bin.000001
+    objectName: mariadb-repl-bin.000001.1791216000
+    firstTime: "2026-10-05T16:40:00Z"
+    lastTime: "2026-10-05T17:40:00Z"
+    firstGtid: 0-10-500
+    lastGtid: 0-10-520
+    rotateEvent: true
+  - serverId: 10
+    binlogFilename: mariadb-repl-bin.000002
+    objectName: mariadb-repl-bin.000002.1791219600
+    firstTime: "2026-10-05T17:40:00Z"
+    lastTime: "2026-10-05T18:40:00Z"
+    firstGtid: 0-10-521
+    lastGtid: 0-10-540
+    rotateEvent: true

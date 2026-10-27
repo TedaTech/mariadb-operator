@@ -15,6 +15,15 @@ var (
 	// override the new value of @@gtid_slave_pos'
 	// Ref: https://mariadb.com/docs/server/reference/error-codes/mariadb-error-codes-1900-to-1999/e1948
 	SQLGtidSlavePosNoValueForDomain = 1948
+	// Error 1947 (HY000): Specified GTID 0-10-1291069 conflicts with the binary log
+	// which contains a more recent GTID 0-11-1294159. If MASTER_GTID_POS=CURRENT_POS
+	// is used, the binlog position will override the new value of @@gtid_slave_pos
+	//
+	// The sibling of 1948: 1948 is raised when @@gtid_slave_pos is cleared for a domain
+	// the binary log still has, 1947 when it is set to a position the binary log has
+	// already passed. Both mean "the binary log is ahead of the value you are assigning".
+	// Ref: https://mariadb.com/docs/server/reference/error-codes/mariadb-error-codes-1900-to-1999/e1947
+	SQLGtidSlavePosBehindBinlog = 1947
 	// Ref: https://mariadb.com/docs/server/reference/error-codes/mariadb-error-codes-1000-to-1099/e1095
 	SQLYouAreNotOwnerOfThread = 1095
 	// Error 1193 (HY000): Unknown system variable 'wsrep_on'
@@ -55,6 +64,11 @@ func IsGtidSlavePosNoValueForDomain(err error) bool {
 // Unknown system variable
 func IsUnknownSystemVariable(err error) bool {
 	return IsSQLErrorNumber(err, SQLUnknownSystemVariable)
+}
+
+// Cannot move `gtid_slave_pos` back behind the binary log
+func IsGtidSlavePosBehindBinlog(err error) bool {
+	return IsSQLErrorNumber(err, SQLGtidSlavePosBehindBinlog)
 }
 
 // You are not owner of thread
